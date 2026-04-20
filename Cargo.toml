@@ -1,0 +1,38 @@
+[package]
+name = "rat"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal session multiplexer built for cloud workflows — session state lives in an append-only event log, not in the daemon process."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/seamoss/rat"
+homepage = "https://github.com/seamoss/rat"
+keywords = ["terminal", "multiplexer", "tmux", "session", "pty"]
+categories = ["command-line-utilities"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rat-daemon"
+path = "src/bin/rat-daemon.rs"
+
+[[bin]]
+name = "rat"
+path = "src/bin/rat.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+libc = "0.2"
+portable-pty = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "fs", "sync", "signal", "net", "time", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
