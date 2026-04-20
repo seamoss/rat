@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
         started: SystemTime::now(),
         command: shell.clone(),
         name: args.name.clone(),
+        aliases: Vec::new(),
     };
     std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?)?;
 

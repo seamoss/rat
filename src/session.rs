@@ -44,6 +44,11 @@ pub struct Session {
 
 // Written to <run_dir>/<id>.meta.json on daemon start, removed on clean exit.
 // Lets `rat list` discover sessions without scanning processes.
+//
+// The daemon writes this file exactly once, at startup. The client rewrites
+// it in-place for rename / alias operations; the daemon never re-reads it,
+// so no coordination is needed beyond the implicit "one writer at a time"
+// that comes from the user driving these commands by hand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub id: SessionId,
@@ -53,4 +58,8 @@ pub struct SessionMeta {
     pub started: SystemTime,
     pub command: String,
     pub name: Option<String>,
+    // Secondary labels that resolve to this session (like symlinks, but for
+    // names). Serde default keeps old meta files loadable.
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }

@@ -43,7 +43,7 @@ struct Cli {
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     version: (),
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -92,27 +92,44 @@ enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Rename a live session (changes the primary name).
+    Rename {
+        /// Current name, alias, UUID, or UUID prefix.
+        id: String,
+        /// New primary name. Must be unique among live sessions.
+        new_name: String,
+    },
+    /// Add an alias to a live session (a secondary name that resolves to it).
+    Alias {
+        /// Session name, alias, UUID, or UUID prefix.
+        id: String,
+        /// New alias. Must be unique among live sessions.
+        alias: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::New { name, cmd, force } => new(name, cmd, force).await,
-        Cmd::Attach { id, force } => {
+        None => spawn_bare(false).await,
+        Some(Cmd::New { name, cmd, force }) => new(name, cmd, force).await,
+        Some(Cmd::Attach { id, force }) => {
             let session_id = resolve_session(&id)?;
             attach(session_id, force).await
         }
-        Cmd::List { force } => {
+        Some(Cmd::List { force }) => {
             if std::io::stdout().is_terminal() {
                 list_pick(force).await
             } else {
                 list_text()
             }
         }
-        Cmd::Replay { path } => replay(&path),
-        Cmd::Init { shell } => init(&shell),
-        Cmd::Kill { id, yes } => kill(&id, yes),
+        Some(Cmd::Replay { path }) => replay(&path),
+        Some(Cmd::Init { shell }) => init(&shell),
+        Some(Cmd::Kill { id, yes }) => kill(&id, yes),
+        Some(Cmd::Rename { id, new_name }) => rename(&id, &new_name),
+        Some(Cmd::Alias { id, alias }) => add_alias(&id, &alias),
     }
 }
 
@@ -123,7 +140,7 @@ fn kill(query: &str, yes: bool) -> Result<()> {
     let metas = read_all_metas()?;
     let matches: Vec<_> = metas
         .iter()
-        .filter(|m| m.name.as_deref() == Some(query) || m.id.to_string().starts_with(query))
+        .filter(|m| meta_has_label(m, query) || m.id.to_string().starts_with(query))
         .cloned()
         .collect();
     let meta = match matches.len() {
@@ -195,6 +212,101 @@ fn kill(query: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
+fn rename(query: &str, new_name: &str) -> Result<()> {
+    let new_name = validate_label(new_name)?;
+    let mut meta = find_live_meta(query)?;
+    if meta.name.as_deref() == Some(new_name) {
+        bail!("session '{query}' is already named '{new_name}'");
+    }
+    ensure_label_free(new_name, Some(meta.id))?;
+
+    let old = meta
+        .name
+        .clone()
+        .unwrap_or_else(|| meta.id.short().to_string());
+    meta.name = Some(new_name.to_string());
+    write_meta(&meta)?;
+    // $RAT_NAME inside the running shell was exported at PTY spawn and can't
+    // be mutated from outside — the prompt decoration will keep showing the
+    // old name until the shell is restarted.
+    println!(
+        "renamed {} '{}' → '{}'  (note: $RAT_NAME in the running shell is unchanged)",
+        meta.id.short(),
+        old,
+        new_name
+    );
+    Ok(())
+}
+
+fn add_alias(query: &str, alias: &str) -> Result<()> {
+    let alias = validate_label(alias)?;
+    let mut meta = find_live_meta(query)?;
+    ensure_label_free(alias, Some(meta.id))?;
+    if meta.aliases.iter().any(|a| a == alias) {
+        bail!("session {} already has alias '{alias}'", meta.id.short());
+    }
+    meta.aliases.push(alias.to_string());
+    write_meta(&meta)?;
+    println!("aliased {} → '{alias}'", meta.id.short());
+    Ok(())
+}
+
+// Resolve a label or UUID to a live session's meta, or error out. Unlike
+// resolve_session this returns the whole meta (so callers can mutate it),
+// and it explicitly rejects dead sessions since rename/alias shouldn't
+// touch stale on-disk state.
+fn find_live_meta(query: &str) -> Result<SessionMeta> {
+    let mut matches: Vec<SessionMeta> = read_all_metas()?
+        .into_iter()
+        .filter(|m| process_alive(m.pid))
+        .filter(|m| meta_has_label(m, query) || m.id.to_string().starts_with(query))
+        .collect();
+    match matches.len() {
+        0 => bail!("no live session matching '{query}'"),
+        1 => Ok(matches.remove(0)),
+        n => bail!("'{query}' matches {n} sessions — use more characters or a unique name"),
+    }
+}
+
+fn ensure_label_free(label: &str, allow_same: Option<SessionId>) -> Result<()> {
+    for m in read_all_metas()? {
+        if !process_alive(m.pid) {
+            continue;
+        }
+        if Some(m.id) == allow_same {
+            continue;
+        }
+        if meta_has_label(&m, label) {
+            bail!(
+                "label '{label}' is already taken by session {}",
+                m.id.short()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_label(label: &str) -> Result<&str> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        bail!("label must not be empty");
+    }
+    // Keep labels out of the namespace that resolve_session treats as a UUID
+    // prefix — otherwise `rat attach <alias>` could be ambiguous with a real
+    // UUID substring.
+    if trimmed.chars().all(|c| c.is_ascii_hexdigit() || c == '-') && trimmed.len() >= 4 {
+        bail!("label '{trimmed}' looks like a UUID prefix — pick something more distinctive");
+    }
+    Ok(trimmed)
+}
+
+fn write_meta(meta: &SessionMeta) -> Result<()> {
+    let path = paths::meta_path(&meta.id.to_string());
+    std::fs::write(&path, serde_json::to_vec_pretty(meta)?)
+        .with_context(|| format!("rewrite {}", path.display()))?;
+    Ok(())
+}
+
 fn cleanup_stale(meta: &SessionMeta) {
     let id = meta.id.to_string();
     let _ = std::fs::remove_file(paths::sock_path(&id));
@@ -256,6 +368,23 @@ end
 
 async fn new(name: Option<String>, cmd: Vec<String>, force: bool) -> Result<()> {
     warn_if_nested(force)?;
+    let session_id = spawn_daemon(name, cmd).await?;
+    // Already passed the nested-session check above; don't prompt again.
+    attach(session_id, true).await
+}
+
+// Bare `rat` with no subcommand: spawn a detached daemon, print its id,
+// don't attach. Useful for scripts and "I want a session to pick up later."
+async fn spawn_bare(force: bool) -> Result<()> {
+    warn_if_nested(force)?;
+    let session_id = spawn_daemon(None, Vec::new()).await?;
+    println!("{session_id}");
+    Ok(())
+}
+
+// Fork rat-daemon into its own session and wait until it's bound the
+// Unix socket. Returns the session id on success.
+async fn spawn_daemon(name: Option<String>, cmd: Vec<String>) -> Result<SessionId> {
     if let Some(n) = &name {
         if n.is_empty() {
             bail!("--name must not be empty");
@@ -340,8 +469,7 @@ async fn new(name: Option<String>, cmd: Vec<String>, force: bool) -> Result<()> 
         );
     }
 
-    // Already passed the nested-session check in new(); don't prompt again.
-    attach(session_id, true).await
+    Ok(session_id)
 }
 
 async fn attach(session_id: SessionId, force: bool) -> Result<()> {
@@ -388,8 +516,10 @@ async fn attach(session_id: SessionId, force: bool) -> Result<()> {
     let done_o = Arc::clone(&done);
     let ended_o = Arc::clone(&ended);
     let exit_code_o = Arc::clone(&exit_code);
+    let passthrough_kbd = kbd_passthrough_enabled();
     let output_task = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
+        let mut filter = OutputFilter::new(passthrough_kbd);
         loop {
             let msg: DaemonMsg = match protocol::read_frame(&mut r).await {
                 Ok(m) => m,
@@ -398,7 +528,8 @@ async fn attach(session_id: SessionId, force: bool) -> Result<()> {
             match msg {
                 DaemonMsg::Event { event } => match event.event {
                     Event::PtyOutput { data } => {
-                        if stdout.write_all(&data).await.is_err() {
+                        let filtered = filter.process(&data);
+                        if !filtered.is_empty() && stdout.write_all(&filtered).await.is_err() {
                             break;
                         }
                         let _ = stdout.flush().await;
@@ -512,17 +643,17 @@ fn list_text() -> Result<()> {
     }
     metas.sort_by_key(|m| m.started);
     println!(
-        "{:<10} {:<16} {:<8} {:<10} {:<14} COMMAND",
+        "{:<10} {:<20} {:<8} {:<10} {:<14} COMMAND",
         "ID", "NAME", "PID", "STATE", "STARTED"
     );
     for m in metas {
         let alive = process_alive(m.pid);
         let state = if alive { "running" } else { "dead" };
-        let name = m.name.clone().unwrap_or_else(|| "-".into());
+        let label = label_column(&m);
         println!(
-            "{:<10} {:<16} {:<8} {:<10} {:<14} {}",
+            "{:<10} {:<20} {:<8} {:<10} {:<14} {}",
             m.id.short(),
-            truncate(&name, 16),
+            truncate(&label, 20),
             m.pid,
             state,
             format_started(m.started),
@@ -530,6 +661,23 @@ fn list_text() -> Result<()> {
         );
     }
     Ok(())
+}
+
+// Primary name plus aliases, collapsed into one cell: `agent,ag,a` or
+// just the name, or `-` if the session has neither.
+fn label_column(m: &SessionMeta) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(n) = &m.name {
+        parts.push(n);
+    }
+    for a in &m.aliases {
+        parts.push(a);
+    }
+    if parts.is_empty() {
+        "-".into()
+    } else {
+        parts.join(",")
+    }
 }
 
 async fn list_pick(force: bool) -> Result<()> {
@@ -607,15 +755,15 @@ fn draw_picker(stdout: &mut std::io::Stdout, items: &[SessionMeta], cursor: usiz
     writeln!(stdout, "\r")?;
     writeln!(
         stdout,
-        "  {DIM}  {:<10} {:<16} {:<14} COMMAND{RESET}\r",
+        "  {DIM}  {:<10} {:<20} {:<14} COMMAND{RESET}\r",
         "ID", "NAME", "STARTED"
     )?;
     for (i, m) in items.iter().enumerate() {
-        let name = m.name.clone().unwrap_or_else(|| "-".into());
+        let label = label_column(m);
         let row = format!(
-            "{:<10} {:<16} {:<14} {}",
+            "{:<10} {:<20} {:<14} {}",
             m.id.short(),
-            truncate(&name, 16),
+            truncate(&label, 20),
             format_started(m.started),
             m.command
         );
@@ -665,11 +813,15 @@ fn read_all_metas() -> Result<Vec<SessionMeta>> {
 
 fn find_live_by_name(name: &str) -> Result<Option<SessionMeta>> {
     for m in read_all_metas()? {
-        if m.name.as_deref() == Some(name) && process_alive(m.pid) {
+        if process_alive(m.pid) && meta_has_label(&m, name) {
             return Ok(Some(m));
         }
     }
     Ok(None)
+}
+
+fn meta_has_label(meta: &SessionMeta, label: &str) -> bool {
+    meta.name.as_deref() == Some(label) || meta.aliases.iter().any(|a| a == label)
 }
 
 fn replay(log_path: &PathBuf) -> Result<()> {
@@ -690,21 +842,22 @@ fn resolve_session(query: &str) -> Result<SessionId> {
     if let Ok(id) = query.parse::<SessionId>() {
         return Ok(id);
     }
-    // Otherwise match against live sessions by name (exact) or UUID prefix.
-    // Dead-pid metas are ignored — you can't attach to a dead daemon anyway.
+    // Otherwise match against live sessions by label (name or alias, exact)
+    // or UUID prefix. Dead-pid metas are ignored — you can't attach to a dead
+    // daemon anyway.
     let mut by_name = Vec::new();
     let mut by_prefix = Vec::new();
     for m in read_all_metas()? {
         if !process_alive(m.pid) {
             continue;
         }
-        if m.name.as_deref() == Some(query) {
+        if meta_has_label(&m, query) {
             by_name.push(m.id);
         } else if m.id.to_string().starts_with(query) {
             by_prefix.push(m.id);
         }
     }
-    // Exact name match takes precedence.
+    // Exact label match takes precedence.
     if !by_name.is_empty() {
         if by_name.len() == 1 {
             return Ok(by_name[0]);
@@ -1083,6 +1236,143 @@ impl InputFilter {
     }
 }
 
+// --- output filter (keyboard-protocol enable stripping) ----------------
+//
+// Some TUIs running inside a rat session (Claude Code, editors using fixterms,
+// kitty's keyboard protocol, xterm's modifyOtherKeys) enable richer key
+// encodings via escape sequences written to their stdout. Those sequences
+// reach the rat client's local terminal and switch it out of legacy encoding.
+// Once that's happened, Ctrl-anything — including our detach prefix — is
+// re-emitted as a multi-byte CSI sequence and our input-side byte scan never
+// matches it.
+//
+// Fix: intercept the daemon→client byte stream and drop the mode-enabling
+// sequences before they reach the local terminal. The app inside the session
+// *thinks* it enabled the protocol but the terminal never flipped, so every
+// keypress stays in legacy encoding and the detach chord keeps working.
+//
+// Stripped:
+//   CSI > … u   (kitty keyboard protocol, push)
+//   CSI = … u   (kitty keyboard protocol, set)
+//   CSI < … u   (kitty keyboard protocol, pop)
+//   CSI ? … u   (kitty keyboard protocol, query)
+//   CSI > 4 … m (xterm modifyOtherKeys)
+//
+// Escape hatch: RAT_PASSTHROUGH_KBD=1 turns the filter into a no-op for
+// users who want the richer input and are willing to exit the inner TUI
+// before detaching.
+
+fn kbd_passthrough_enabled() -> bool {
+    matches!(
+        std::env::var("RAT_PASSTHROUGH_KBD").as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    )
+}
+
+enum OutputState {
+    Normal,
+    Esc,
+    Csi,
+}
+
+struct OutputFilter {
+    state: OutputState,
+    // Holds the in-progress escape sequence (starting with ESC) so we can
+    // either drop it (if it's a keyboard-protocol sequence) or re-emit it
+    // intact (if it's anything else, or malformed).
+    buf: Vec<u8>,
+    passthrough: bool,
+}
+
+impl OutputFilter {
+    fn new(passthrough: bool) -> Self {
+        Self {
+            state: OutputState::Normal,
+            buf: Vec::new(),
+            passthrough,
+        }
+    }
+
+    fn process(&mut self, data: &[u8]) -> Vec<u8> {
+        if self.passthrough {
+            return data.to_vec();
+        }
+        let mut out = Vec::with_capacity(data.len());
+        for &b in data {
+            match self.state {
+                OutputState::Normal => {
+                    if b == 0x1b {
+                        self.buf.clear();
+                        self.buf.push(b);
+                        self.state = OutputState::Esc;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                OutputState::Esc => {
+                    self.buf.push(b);
+                    if b == b'[' {
+                        self.state = OutputState::Csi;
+                    } else {
+                        // Not a CSI — flush buffered ESC + this byte.
+                        out.extend_from_slice(&self.buf);
+                        self.buf.clear();
+                        self.state = OutputState::Normal;
+                    }
+                }
+                OutputState::Csi => {
+                    self.buf.push(b);
+                    if (0x40..=0x7e).contains(&b) {
+                        // Final byte; decide whether to strip.
+                        if !should_strip_csi(&self.buf) {
+                            out.extend_from_slice(&self.buf);
+                        }
+                        self.buf.clear();
+                        self.state = OutputState::Normal;
+                    } else if !(0x20..=0x3f).contains(&b) {
+                        // Malformed CSI (e.g., ESC or control byte mid-sequence).
+                        // Flush what we have and reset.
+                        out.extend_from_slice(&self.buf);
+                        self.buf.clear();
+                        self.state = OutputState::Normal;
+                    }
+                    // else: still accumulating params / intermediates.
+                }
+            }
+        }
+        out
+    }
+}
+
+// `buf` is a complete CSI starting with ESC '[' and ending with a final
+// byte in 0x40..=0x7e. Decide whether it's a keyboard-protocol sequence
+// we should drop.
+fn should_strip_csi(buf: &[u8]) -> bool {
+    if buf.len() < 3 {
+        return false;
+    }
+    let body = &buf[2..];
+    let final_byte = *body.last().unwrap();
+    let params = &body[..body.len() - 1];
+
+    match final_byte {
+        b'u' => {
+            // Kitty keyboard protocol: CSI > / = / < / ? … u
+            matches!(params.first(), Some(b'>' | b'=' | b'<' | b'?'))
+        }
+        b'm' => {
+            // xterm modifyOtherKeys: CSI > 4 [; Pm] m
+            if params.first() != Some(&b'>') {
+                return false;
+            }
+            let rest = &params[1..];
+            let first_param = rest.split(|&c| c == b';').next().unwrap_or(b"");
+            first_param == b"4"
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1161,5 +1451,111 @@ mod tests {
         let out = f.process(&[0x01, b'd', b'z', b'z']);
         assert!(out.forward.is_empty());
         assert!(out.detach);
+    }
+
+    // --- OutputFilter tests ---
+
+    #[test]
+    fn output_passes_plain_bytes() {
+        let mut f = OutputFilter::new(false);
+        assert_eq!(f.process(b"hello world"), b"hello world");
+    }
+
+    #[test]
+    fn output_strips_kitty_push() {
+        // CSI > 1 u (enable kitty keyboard protocol, flags=1)
+        let mut f = OutputFilter::new(false);
+        let out = f.process(b"before\x1b[>1uafter");
+        assert_eq!(out, b"beforeafter");
+    }
+
+    #[test]
+    fn output_strips_kitty_pop() {
+        let mut f = OutputFilter::new(false);
+        assert_eq!(f.process(b"x\x1b[<uy"), b"xy");
+        // CSI < N u pop-N variant
+        let mut f2 = OutputFilter::new(false);
+        assert_eq!(f2.process(b"x\x1b[<1uy"), b"xy");
+    }
+
+    #[test]
+    fn output_strips_kitty_set_and_query() {
+        let mut f = OutputFilter::new(false);
+        assert_eq!(f.process(b"\x1b[=15;1u"), b"");
+        assert_eq!(f.process(b"\x1b[?u"), b"");
+    }
+
+    #[test]
+    fn output_strips_modify_other_keys() {
+        let mut f = OutputFilter::new(false);
+        // CSI > 4 ; 2 m
+        assert_eq!(f.process(b"\x1b[>4;2m"), b"");
+        // CSI > 4 ; 0 m (disable)
+        assert_eq!(f.process(b"\x1b[>4;0m"), b"");
+        // CSI > 4 m (reset, no second param)
+        assert_eq!(f.process(b"\x1b[>4m"), b"");
+    }
+
+    #[test]
+    fn output_preserves_unrelated_csi() {
+        let mut f = OutputFilter::new(false);
+        // SGR color — final byte 'm' but no '>' private intermediate.
+        assert_eq!(f.process(b"\x1b[31mred\x1b[0m"), b"\x1b[31mred\x1b[0m");
+        // Cursor position — final byte 'H'.
+        assert_eq!(f.process(b"\x1b[5;10H"), b"\x1b[5;10H");
+        // Other xterm private mode on 'm' with different first param.
+        assert_eq!(f.process(b"\x1b[>2;1m"), b"\x1b[>2;1m");
+    }
+
+    #[test]
+    fn output_preserves_bare_escape_and_non_csi() {
+        let mut f = OutputFilter::new(false);
+        // ESC 7 (save cursor) — not a CSI.
+        assert_eq!(f.process(b"\x1b7"), b"\x1b7");
+        // OSC — not CSI (starts with ESC ]).
+        assert_eq!(f.process(b"\x1b]0;title\x07"), b"\x1b]0;title\x07");
+    }
+
+    #[test]
+    fn output_handles_split_across_buffers() {
+        let mut f = OutputFilter::new(false);
+        // Feed `\x1b[>1u` one byte at a time — nothing should emit until
+        // we know the sequence is kitty's keyboard push, at which point
+        // it's dropped entirely.
+        assert_eq!(f.process(b"\x1b"), b"");
+        assert_eq!(f.process(b"["), b"");
+        assert_eq!(f.process(b">"), b"");
+        assert_eq!(f.process(b"1"), b"");
+        assert_eq!(f.process(b"u"), b"");
+        assert_eq!(f.process(b"next"), b"next");
+    }
+
+    #[test]
+    fn output_flushes_non_matching_split() {
+        let mut f = OutputFilter::new(false);
+        // Color sequence split mid-stream — must emit in full.
+        assert_eq!(f.process(b"\x1b[3"), b"");
+        assert_eq!(f.process(b"1m"), b"\x1b[31m");
+    }
+
+    #[test]
+    fn output_passthrough_is_identity() {
+        let mut f = OutputFilter::new(true);
+        // Even the stripped forms should pass through unchanged.
+        assert_eq!(
+            f.process(b"\x1b[>1u\x1b[<u\x1b[>4;2m"),
+            b"\x1b[>1u\x1b[<u\x1b[>4;2m"
+        );
+    }
+
+    #[test]
+    fn output_recovers_from_malformed_csi() {
+        let mut f = OutputFilter::new(false);
+        // ESC inside a CSI params area — abort the current sequence, emit,
+        // then handle the new ESC fresh.
+        let got = f.process(b"\x1b[3\x1b[31m");
+        // First partial `\x1b[3` should be flushed when the inner ESC arrives;
+        // second `\x1b[31m` is an SGR and passes through.
+        assert!(got.ends_with(b"\x1b[31m"));
     }
 }

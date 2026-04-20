@@ -9,7 +9,7 @@ replayed later as an event stream.
 ╭────────────────────────────────────────────────────────────╮
 │                                                            │
 │   █▀█ ▄▀█ ▀█▀                                              │
-│   █▀▄ █▀█ ░█░   rat v0.2.0 · cloud-terminal multiplexer    │
+│   █▀▄ █▀█ ░█░   rat v0.2.1 · cloud-terminal multiplexer    │
 │                                                            │
 ╰────────────────────────────────────────────────────────────╯
 ```
@@ -154,6 +154,22 @@ rat replay ~/.local/state/rat/<uuid>.log
 
 ## Commands
 
+### `rat` (no subcommand)
+
+Spawn a detached session with a fresh UUID, print the UUID to stdout, and
+exit without attaching. Useful for scripts and for "give me a session I
+can pick up later":
+
+```sh
+$ id=$(rat)
+$ echo "$id"
+f898f408-98a6-4c89-811f-aa3ea6f7eecf
+$ rat attach "$id"
+```
+
+Respects the nested-session warning. For named or custom-command creates,
+use `rat new`.
+
 ### `rat new [-n, --name NAME] [-f, --force] [-- CMD [ARGS...]]`
 
 Create a new session and attach to it. The daemon forks itself into a new
@@ -182,6 +198,33 @@ Show running sessions. In a TTY, pops up an arrow-key picker: ↑/↓ (or
 `j`/`k`) to navigate, Enter attaches, `Esc`/`q`/`Ctrl-C` cancels. When the
 output is piped, prints a plain text table so scripts continue to work.
 `--force` applies to the attach that follows a picker selection.
+
+### `rat rename ID_OR_NAME NEW_NAME`
+
+Change a live session's primary name. The new name must be unique among
+live sessions (including aliases).
+
+```sh
+rat rename agent staging
+```
+
+**Caveat:** `$RAT_NAME` inside the already-running shell was exported at
+PTY spawn time and cannot be mutated from outside. Prompts decorated via
+`rat init` will keep showing the old name until the shell restarts.
+
+### `rat alias ID_OR_NAME ALIAS`
+
+Add a secondary label that also resolves to the session. Useful when you
+want a long descriptive name and a short handle:
+
+```sh
+rat new -n processing-pipeline
+rat alias processing-pipeline pp
+rat attach pp      # resolves to processing-pipeline
+```
+
+Aliases share the same namespace as names; they must be unique among live
+sessions. They disappear when the session ends.
 
 ### `rat kill ID_OR_NAME [-y, --yes]`
 
@@ -284,6 +327,15 @@ Read by the `rat` client:
 
 - `RAT_PREFIX` — override the default `Ctrl-A` detach prefix. See
   [Keybindings](#keybindings).
+- `RAT_PASSTHROUGH_KBD` — set to `1` to disable the keyboard-protocol
+  stripper. By default the client swallows `CSI > … u` / `CSI = … u` /
+  `CSI < u` / `CSI ? … u` (kitty keyboard protocol) and `CSI > 4 … m`
+  (xterm modifyOtherKeys) from the daemon→client byte stream so that
+  inner TUIs can't flip your terminal into a mode that re-encodes the
+  detach chord. With passthrough on, you get richer keyboard input
+  inside apps like Claude Code, but the detach chord may stop working
+  while such an app is in the foreground — you'll have to exit the app
+  to detach.
 
 ## Architecture (tl;dr)
 
@@ -332,6 +384,13 @@ unchanged, the integration isn't being sourced.
 **Terminal looks wedged after a crash.**
 Run `reset` or `stty sane`. Rat tries to restore cooked mode on Drop, but
 a hard kill (`kill -9` on the client) bypasses that.
+
+**A TUI inside my session has weirder-than-usual keyboard behaviour.**
+Rat strips kitty-keyboard-protocol and xterm-modifyOtherKeys enable
+sequences from PTY output so the detach chord keeps working. If an inner
+app depends on those protocols and misbehaves as a result, set
+`RAT_PASSTHROUGH_KBD=1` before attaching. Trade-off: the app gets the
+richer input, but detaching may only work once you've exited the app.
 
 ## Roadmap
 

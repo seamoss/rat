@@ -301,6 +301,18 @@ Discovery is via scanning `run/*.meta.json` — cheap, no extra index, no
 process-listing required. `rat list` loads them, checks liveness via
 `kill(pid, 0)`, and sorts by `started`.
 
+The meta file has two writers by design:
+
+- The **daemon** writes it once at startup and removes it on clean exit.
+- The **client** rewrites it in-place for `rat rename` and `rat alias`.
+
+The daemon never re-reads the file after startup, so there's no
+coordination problem — names and aliases are purely a client-visible
+discovery concern. A crashed daemon leaves a stale meta behind; `rat
+kill <id>` sweeps it, and `rat list`'s interactive picker hides dead
+sessions. Aliases carry zero weight in the event log (they don't change
+session identity) and disappear with the session.
+
 Two things are deliberately *not* in the meta file:
 
 - The full command line. Only the executable path. (Reasoning: less
@@ -382,6 +394,33 @@ The tradeoff is one extra keypress per detach and an `RAT_PREFIX` env knob
 for users with conflicting muscle memory. The chord lives in
 `InputFilter` in `src/bin/rat.rs`; see its `process()` doc comment for the
 state machine.
+
+### Why strip keyboard-protocol-enable sequences from PTY output?
+
+Even with a prefix chord (see above), a TUI running inside the session
+can still break detach by enabling kitty's CSI-u or xterm's
+modifyOtherKeys protocol. Those sequences aren't instructions to the app
+running them — they're *to the terminal*, asking it to flip encoding
+mode. Once flipped, every subsequent keypress — prefix included — arrives
+at the rat client as a CSI sequence the input scanner doesn't recognise.
+
+`OutputFilter` in `src/bin/rat.rs` watches the daemon→client stream for
+the specific enable/pop/query forms and drops them before they reach the
+local terminal:
+
+  - `CSI > … u`, `CSI = … u`, `CSI < … u`, `CSI ? … u` (kitty keyboard
+    protocol)
+  - `CSI > 4 … m` (xterm modifyOtherKeys)
+
+Unrelated sequences with a `u` final (none standard), plain SGR `m`,
+and every other CSI pass through unchanged. Escape hatch:
+`RAT_PASSTHROUGH_KBD=1` disables the filter for users who want the
+richer input and are willing to exit the inner TUI before detaching.
+
+This is asymmetric with the input filter on purpose: the input side only
+needs to find a single prefix byte, the output side has to recognise a
+small finite set of sequences. Both are kept small and covered by unit
+tests.
 
 ### Why `setsid` over the classic double-fork daemonize?
 
