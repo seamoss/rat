@@ -154,16 +154,18 @@ rat replay ~/.local/state/rat/<uuid>.log
 
 ## Commands
 
-### `rat new [-n, --name NAME] [-- CMD [ARGS...]]`
+### `rat new [-n, --name NAME] [-f, --force] [-- CMD [ARGS...]]`
 
 Create a new session and attach to it. The daemon forks itself into a new
 session (`setsid`), so closing your terminal won't take it down.
 
 - `--name NAME` (short `-n`): human-friendly label. Names must be unique
   among live sessions. Exported as `$RAT_NAME` to the child.
+- `--force` (short `-f`): skip the nested-session warning (see
+  [Nested sessions](#nested-sessions)).
 - Anything after `--` becomes the command to run. Defaults to `$SHELL`.
 
-### `rat attach ID_OR_NAME`
+### `rat attach ID_OR_NAME [-f, --force]`
 
 Attach to an existing session. `ID_OR_NAME` can be:
 
@@ -171,13 +173,15 @@ Attach to an existing session. `ID_OR_NAME` can be:
 - A unique UUID prefix (e.g., `a4b2`)
 - A session name (e.g., `agent`)
 
-Exact name match wins over prefix match if both would apply.
+Exact name match wins over prefix match if both would apply. `--force`
+(short `-f`) skips the nested-session warning.
 
-### `rat list`
+### `rat list [-f, --force]`
 
 Show running sessions. In a TTY, pops up an arrow-key picker: ↑/↓ (or
 `j`/`k`) to navigate, Enter attaches, `Esc`/`q`/`Ctrl-C` cancels. When the
 output is piped, prints a plain text table so scripts continue to work.
+`--force` applies to the attach that follows a picker selection.
 
 ### `rat kill ID_OR_NAME [-y, --yes]`
 
@@ -233,6 +237,17 @@ rat new -n agent
 
 Supported values: `C-a` through `C-z`, plus `C-\`, `C-]`, `C-^`, `C-_`. An
 invalid value causes `rat attach` to fail fast before entering raw mode.
+
+## Nested sessions
+
+`rat new` / `rat attach` / `rat list` detect when you're already inside a
+rat session (via `$RAT_SESSION`) and show a warning + `[y/N]` prompt before
+proceeding. Nesting isn't blocked — there are legitimate reasons to do it
+— but it's rarely what you want: detach chords route to the outermost
+client, raw-mode clients stack, and input handling gets confusing.
+
+If you know what you're doing, pass `-f` / `--force` to skip the prompt,
+or detach from the outer session first.
 
 ## Filesystem layout
 

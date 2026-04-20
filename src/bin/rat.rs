@@ -53,6 +53,9 @@ enum Cmd {
         /// Optional human-friendly name (also exported as $RAT_NAME).
         #[arg(short, long)]
         name: Option<String>,
+        /// Skip the nested-session warning and proceed.
+        #[arg(short, long)]
+        force: bool,
         /// Command to run in the new session; defaults to $SHELL.
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -61,9 +64,16 @@ enum Cmd {
     Attach {
         /// Session name, or UUID / unique UUID prefix.
         id: String,
+        /// Skip the nested-session warning and proceed.
+        #[arg(short, long)]
+        force: bool,
     },
     /// List running sessions.
-    List,
+    List {
+        /// Skip the nested-session warning when the picker would attach.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Replay a session log file non-interactively.
     Replay {
         /// Path to the .log file (under ~/.local/state/rat/).
@@ -88,14 +98,14 @@ enum Cmd {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::New { name, cmd } => new(name, cmd).await,
-        Cmd::Attach { id } => {
+        Cmd::New { name, cmd, force } => new(name, cmd, force).await,
+        Cmd::Attach { id, force } => {
             let session_id = resolve_session(&id)?;
-            attach(session_id).await
+            attach(session_id, force).await
         }
-        Cmd::List => {
+        Cmd::List { force } => {
             if std::io::stdout().is_terminal() {
-                list_pick().await
+                list_pick(force).await
             } else {
                 list_text()
             }
@@ -244,7 +254,8 @@ if set -q RAT_SESSION
 end
 "#;
 
-async fn new(name: Option<String>, cmd: Vec<String>) -> Result<()> {
+async fn new(name: Option<String>, cmd: Vec<String>, force: bool) -> Result<()> {
+    warn_if_nested(force)?;
     if let Some(n) = &name {
         if n.is_empty() {
             bail!("--name must not be empty");
@@ -329,10 +340,12 @@ async fn new(name: Option<String>, cmd: Vec<String>) -> Result<()> {
         );
     }
 
-    attach(session_id).await
+    // Already passed the nested-session check in new(); don't prompt again.
+    attach(session_id, true).await
 }
 
-async fn attach(session_id: SessionId) -> Result<()> {
+async fn attach(session_id: SessionId, force: bool) -> Result<()> {
+    warn_if_nested(force)?;
     // Resolve the detach prefix before we enter raw mode — a bad RAT_PREFIX
     // should surface as a normal error, not a stuck terminal.
     let prefix = resolve_prefix()?;
@@ -519,7 +532,7 @@ fn list_text() -> Result<()> {
     Ok(())
 }
 
-async fn list_pick() -> Result<()> {
+async fn list_pick(force: bool) -> Result<()> {
     let mut alive: Vec<SessionMeta> = read_all_metas()?
         .into_iter()
         .filter(|m| process_alive(m.pid))
@@ -530,13 +543,18 @@ async fn list_pick() -> Result<()> {
     }
     alive.sort_by_key(|m| m.started);
 
+    // Prompt before opening the picker — an alt-screen picker flickering up
+    // only to bail on the inner attach would be worse UX.
+    warn_if_nested(force)?;
+
     // Separate the raw-mode/alt-screen scope from the await below: we MUST
     // restore the terminal before calling attach(), otherwise attach()'s own
     // raw-mode setup collides with our own.
     let selected = run_picker(&alive)?;
 
     if let Some(id) = selected {
-        attach(id).await?;
+        // Already confirmed — don't prompt again from inside attach().
+        attach(id, true).await?;
     }
     Ok(())
 }
@@ -890,6 +908,80 @@ fn print_session_ended(session_id: &str, name: Option<&str>, exit_code: Option<i
     eprintln!("{}", frame_blank());
     eprintln!("{}", frame_bot());
     eprintln!();
+}
+
+// --- nested-session guard ------------------------------------------------
+
+fn warn_if_nested(force: bool) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    let outer = match std::env::var("RAT_SESSION") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return Ok(()),
+    };
+    let outer_name = std::env::var("RAT_NAME").ok().filter(|n| !n.is_empty());
+    let short = &outer[..outer.len().min(8)];
+    let label = outer_name.as_deref().unwrap_or(short);
+
+    eprintln!();
+    eprintln!("{}", frame_top());
+    eprintln!("{}", frame_blank());
+    eprintln!(
+        "{}",
+        frame_row(&format!(
+            "   {ORANGE}{BOLD}⚠  nested rat session detected{RESET}"
+        ))
+    );
+    eprintln!("{}", frame_blank());
+    eprintln!(
+        "{}",
+        frame_row(&format!("   you are inside:  {BOLD}{label}{RESET}"))
+    );
+    eprintln!("{}", frame_blank());
+    eprintln!(
+        "{}",
+        frame_row(&format!(
+            "   {DIM}Running rat inside rat stacks raw-mode clients,{RESET}"
+        ))
+    );
+    eprintln!(
+        "{}",
+        frame_row(&format!(
+            "   {DIM}routes the detach chord to the outermost client,{RESET}"
+        ))
+    );
+    eprintln!(
+        "{}",
+        frame_row(&format!(
+            "   {DIM}and generally leads to confusing input behaviour.{RESET}"
+        ))
+    );
+    eprintln!("{}", frame_blank());
+    eprintln!(
+        "{}",
+        frame_row(&format!(
+            "   {DIM}Detach first ({BOLD}<prefix> d{RESET}{DIM}) unless you know{RESET}"
+        ))
+    );
+    eprintln!(
+        "{}",
+        frame_row(&format!(
+            "   {DIM}you want this. Pass {BOLD}--force{RESET}{DIM} to skip this prompt.{RESET}"
+        ))
+    );
+    eprintln!("{}", frame_blank());
+    eprintln!("{}", frame_bot());
+    eprintln!();
+
+    eprint!("Continue anyway? [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        _ => bail!("aborted — already inside rat session '{label}'"),
+    }
 }
 
 // --- detach chord --------------------------------------------------------
