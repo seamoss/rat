@@ -9,7 +9,7 @@ replayed later as an event stream.
 ╭────────────────────────────────────────────────────────────╮
 │                                                            │
 │   █▀█ ▄▀█ ▀█▀                                              │
-│   █▀▄ █▀█ ░█░   rat v0.1.0 · cloud-terminal multiplexer    │
+│   █▀▄ █▀█ ░█░   rat v0.2.0 · cloud-terminal multiplexer    │
 │                                                            │
 ╰────────────────────────────────────────────────────────────╯
 ```
@@ -129,7 +129,7 @@ rat new -n agent
 # ... you're in a shell. Inside:
 echo "$RAT_NAME / $RAT_SESSION"
 ls
-# Press Ctrl-\ to detach. The daemon keeps running.
+# Press Ctrl-A then d to detach. The daemon keeps running.
 
 # List live sessions
 rat list
@@ -200,14 +200,39 @@ Print shell integration code to stdout. `SHELL` is `zsh`, `bash`, or
 
 ## Keybindings
 
-Inside an attached session:
+Rat uses a prefix chord for its own commands, in the tradition of `screen`
+and `tmux`. Default prefix is `Ctrl-A`. Inside an attached session:
 
-| Key      | Action                                                      |
-| -------- | ----------------------------------------------------------- |
-| `Ctrl-\` | Detach from the session (daemon keeps running)              |
-| `Ctrl-D` | Normal shell EOF — exits the shell and ends the session     |
+| Keys                | Action                                                  |
+| ------------------- | ------------------------------------------------------- |
+| `Ctrl-A` then `d`   | Detach from the session (daemon keeps running)          |
+| `Ctrl-A` `Ctrl-A`   | Send a literal `Ctrl-A` through to the inner program    |
+| `Ctrl-D`            | Normal shell EOF — exits the shell and ends the session |
 
-All other input is forwarded verbatim to the PTY.
+All other input is forwarded verbatim to the PTY. Any unrecognized chord
+command (e.g., `Ctrl-A x`) is silently swallowed.
+
+### Why a chord, not a single key?
+
+A lot of modern TUIs (Claude Code, editors using kitty's CSI-u or xterm's
+modifyOtherKeys) enable keyboard-encoding protocols that re-encode every
+keypress — including `Ctrl-<anything>` — into multi-byte escape sequences.
+A single-byte detach key gets silently swallowed in that regime. A two-key
+chord survives because the command key (`d`) is still distinguishable even
+if the prefix's on-the-wire encoding shifts.
+
+### Customizing the prefix
+
+Set `RAT_PREFIX` in your environment before `rat new` / `rat attach`. Form
+is `C-<letter>`:
+
+```sh
+export RAT_PREFIX=C-b     # tmux-style
+rat new -n agent
+```
+
+Supported values: `C-a` through `C-z`, plus `C-\`, `C-]`, `C-^`, `C-_`. An
+invalid value causes `rat attach` to fail fast before entering raw mode.
 
 ## Filesystem layout
 
@@ -229,7 +254,9 @@ Sock and meta files are removed on clean shutdown (or by `rat kill` on
 stale ones). Log files accumulate — they're your scrollback history, safe
 to clean up with `rm` when you don't need them.
 
-## Environment variables the daemon exports
+## Environment variables
+
+Exported by the daemon into each session:
 
 - `RAT_SESSION` — the session's UUID. Always set.
 - `RAT_NAME` — the session's name, if one was provided.
@@ -237,6 +264,11 @@ to clean up with `rm` when you don't need them.
 Shell integrations (`rat init ...`) read these to customize the prompt.
 You can read them directly in scripts too — e.g., `if [ -n "$RAT_SESSION" ]`
 to know whether you're inside rat.
+
+Read by the `rat` client:
+
+- `RAT_PREFIX` — override the default `Ctrl-A` detach prefix. See
+  [Keybindings](#keybindings).
 
 ## Architecture (tl;dr)
 

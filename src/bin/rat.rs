@@ -18,11 +18,30 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{Notify, mpsc};
 
-const DETACH_KEY: u8 = 0x1c; // Ctrl-\
+// Detach is a prefix chord rather than a single key because a single key
+// (Ctrl-\, etc.) is unreliable once a TUI inside the session enables a
+// keyboard-encoding protocol like kitty's CSI-u or xterm's modifyOtherKeys.
+// Those protocols re-encode every keypress — including Ctrl-anything — into
+// CSI sequences, so a byte-equality scan misses them. A two-step chord
+// degrades less often: even if the prefix gets re-encoded by the TUI, the
+// follow-up command key still uniquely identifies an intent. Default
+// `Ctrl-A` matches `screen`'s long-standing convention; users can override
+// via `RAT_PREFIX`.
+const DEFAULT_PREFIX: u8 = 0x01; // Ctrl-A
+const CMD_DETACH: u8 = b'd';
 
 #[derive(Parser)]
-#[command(name = "rat", about = "Rat — cloud-terminal session multiplexer")]
+#[command(
+    name = "rat",
+    about = "Rat — cloud-terminal session multiplexer",
+    version,
+    // Disable clap's default capital -V so we can bind -v ourselves.
+    disable_version_flag = true
+)]
 struct Cli {
+    /// Print version and exit.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    version: (),
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -94,9 +113,7 @@ fn kill(query: &str, yes: bool) -> Result<()> {
     let metas = read_all_metas()?;
     let matches: Vec<_> = metas
         .iter()
-        .filter(|m| {
-            m.name.as_deref() == Some(query) || m.id.to_string().starts_with(query)
-        })
+        .filter(|m| m.name.as_deref() == Some(query) || m.id.to_string().starts_with(query))
         .cloned()
         .collect();
     let meta = match matches.len() {
@@ -316,6 +333,10 @@ async fn new(name: Option<String>, cmd: Vec<String>) -> Result<()> {
 }
 
 async fn attach(session_id: SessionId) -> Result<()> {
+    // Resolve the detach prefix before we enter raw mode — a bad RAT_PREFIX
+    // should surface as a normal error, not a stuck terminal.
+    let prefix = resolve_prefix()?;
+
     let sock = paths::sock_path(&session_id.to_string());
     let stream = UnixStream::connect(&sock)
         .await
@@ -327,11 +348,7 @@ async fn attach(session_id: SessionId) -> Result<()> {
     let mut r = BufReader::new(r);
     let w = Arc::new(tokio::sync::Mutex::new(w));
 
-    protocol::write_frame(
-        &mut *w.lock().await,
-        &ClientMsg::Attach { from_seq: 0 },
-    )
-    .await?;
+    protocol::write_frame(&mut *w.lock().await, &ClientMsg::Attach { from_seq: 0 }).await?;
 
     let first: DaemonMsg = protocol::read_frame(&mut r).await?;
     let (sid, sname) = match first {
@@ -342,15 +359,11 @@ async fn attach(session_id: SessionId) -> Result<()> {
         _ => bail!("expected Attached first"),
     };
 
-    print_attach_banner(&sid, sname.as_deref());
+    print_attach_banner(&sid, sname.as_deref(), prefix);
 
     // Resize to match this client's terminal (in case we reattached from a
     // different-sized terminal than the one that started the session).
-    protocol::write_frame(
-        &mut *w.lock().await,
-        &ClientMsg::Resize { cols, rows },
-    )
-    .await?;
+    protocol::write_frame(&mut *w.lock().await, &ClientMsg::Resize { cols, rows }).await?;
 
     let _raw = RawModeGuard::enable()?;
 
@@ -395,7 +408,7 @@ async fn attach(session_id: SessionId) -> Result<()> {
         done_o.notify_waiters();
     });
 
-    // stdin reader thread → channel (raw bytes, with Ctrl-\ as detach).
+    // stdin reader thread → channel (raw bytes).
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     std::thread::Builder::new()
         .name("stdin-reader".into())
@@ -414,28 +427,27 @@ async fn attach(session_id: SessionId) -> Result<()> {
             }
         })?;
 
-    // input_task: channel → daemon Input, with detach-key detection.
+    // input_task: channel → daemon Input, intercepting the detach chord.
     let w_i = Arc::clone(&w);
     let done_i = Arc::clone(&done);
     let input_task = tokio::spawn(async move {
+        let mut filter = InputFilter::new(prefix);
         while let Some(data) = stdin_rx.recv().await {
-            if let Some(pos) = data.iter().position(|&b| b == DETACH_KEY) {
-                if pos > 0 {
-                    let _ = protocol::write_frame(
-                        &mut *w_i.lock().await,
-                        &ClientMsg::Input {
-                            data: data[..pos].to_vec(),
-                        },
-                    )
-                    .await;
-                }
-                let _ = protocol::write_frame(&mut *w_i.lock().await, &ClientMsg::Detach).await;
-                break;
-            }
-            if protocol::write_frame(&mut *w_i.lock().await, &ClientMsg::Input { data })
+            let action = filter.process(&data);
+            if !action.forward.is_empty()
+                && protocol::write_frame(
+                    &mut *w_i.lock().await,
+                    &ClientMsg::Input {
+                        data: action.forward,
+                    },
+                )
                 .await
                 .is_err()
             {
+                break;
+            }
+            if action.detach {
+                let _ = protocol::write_frame(&mut *w_i.lock().await, &ClientMsg::Detach).await;
                 break;
             }
         }
@@ -487,8 +499,8 @@ fn list_text() -> Result<()> {
     }
     metas.sort_by_key(|m| m.started);
     println!(
-        "{:<10} {:<16} {:<8} {:<10} {:<14} {}",
-        "ID", "NAME", "PID", "STATE", "STARTED", "COMMAND"
+        "{:<10} {:<16} {:<8} {:<10} {:<14} COMMAND",
+        "ID", "NAME", "PID", "STATE", "STARTED"
     );
     for m in metas {
         let alive = process_alive(m.pid);
@@ -543,9 +555,7 @@ fn run_picker(items: &[SessionMeta]) -> Result<Option<SessionId>> {
             if let ct_event::Event::Key(k) = ev {
                 match k.code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if cursor > 0 {
-                            cursor -= 1;
-                        }
+                        cursor = cursor.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         if cursor + 1 < items.len() {
@@ -570,11 +580,7 @@ fn run_picker(items: &[SessionMeta]) -> Result<Option<SessionId>> {
     result
 }
 
-fn draw_picker(
-    stdout: &mut std::io::Stdout,
-    items: &[SessionMeta],
-    cursor: usize,
-) -> Result<()> {
+fn draw_picker(stdout: &mut std::io::Stdout, items: &[SessionMeta], cursor: usize) -> Result<()> {
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
     writeln!(
         stdout,
@@ -583,8 +589,8 @@ fn draw_picker(
     writeln!(stdout, "\r")?;
     writeln!(
         stdout,
-        "  {DIM}  {:<10} {:<16} {:<14} {}{RESET}\r",
-        "ID", "NAME", "STARTED", "COMMAND"
+        "  {DIM}  {:<10} {:<16} {:<14} COMMAND{RESET}\r",
+        "ID", "NAME", "STARTED"
     )?;
     for (i, m) in items.iter().enumerate() {
         let name = m.name.clone().unwrap_or_else(|| "-".into());
@@ -781,19 +787,17 @@ fn frame_row(content: &str) -> String {
     )
 }
 
-fn print_attach_banner(session_id: &str, name: Option<&str>) {
+fn print_attach_banner(session_id: &str, name: Option<&str>, prefix: u8) {
     let short = &session_id[..session_id.len().min(8)];
     // OSC 2: set terminal title.
     eprint!("\x1b]2;[rat] {short}\x07");
 
     let version = env!("CARGO_PKG_VERSION");
+    let pd = prefix_display(prefix);
     eprintln!();
     eprintln!("{}", frame_top());
     eprintln!("{}", frame_blank());
-    eprintln!(
-        "{}",
-        frame_row(&format!("   {ORANGE}█▀█ ▄▀█ ▀█▀{RESET}"))
-    );
+    eprintln!("{}", frame_row(&format!("   {ORANGE}█▀█ ▄▀█ ▀█▀{RESET}")));
     eprintln!(
         "{}",
         frame_row(&format!(
@@ -810,8 +814,12 @@ fn print_attach_banner(session_id: &str, name: Option<&str>) {
     }
     eprintln!(
         "{}",
+        frame_row(&format!("   detach:   {BOLD}{pd} d{RESET}"))
+    );
+    eprintln!(
+        "{}",
         frame_row(&format!(
-            "   detach:   {BOLD}Ctrl-\\{RESET}   {DIM}(exit / Ctrl-D to end session){RESET}"
+            "   {DIM}({pd} {pd} for literal · Ctrl-D / exit ends session){RESET}"
         ))
     );
     eprintln!("{}", frame_blank());
@@ -836,7 +844,8 @@ fn print_detach_banner(session_id: &str, name: Option<&str>) {
         "{}",
         frame_row(&format!(
             "   still running:  {BOLD}{short}{RESET}{}",
-            name.map(|n| format!(" {DIM}({n}){RESET}")).unwrap_or_default()
+            name.map(|n| format!(" {DIM}({n}){RESET}"))
+                .unwrap_or_default()
         ))
     );
     eprintln!(
@@ -866,7 +875,8 @@ fn print_session_ended(session_id: &str, name: Option<&str>, exit_code: Option<i
         "{}",
         frame_row(&format!(
             "   session:    {BOLD}{short}{RESET}{}",
-            name.map(|n| format!(" {DIM}({n}){RESET}")).unwrap_or_default()
+            name.map(|n| format!(" {DIM}({n}){RESET}"))
+                .unwrap_or_default()
         ))
     );
     let exit_str = match exit_code {
@@ -880,4 +890,184 @@ fn print_session_ended(session_id: &str, name: Option<&str>, exit_code: Option<i
     eprintln!("{}", frame_blank());
     eprintln!("{}", frame_bot());
     eprintln!();
+}
+
+// --- detach chord --------------------------------------------------------
+
+fn resolve_prefix() -> Result<u8> {
+    match std::env::var("RAT_PREFIX") {
+        Ok(s) => {
+            parse_prefix(&s).with_context(|| format!("parse RAT_PREFIX='{s}' (expected 'C-<key>')"))
+        }
+        Err(_) => Ok(DEFAULT_PREFIX),
+    }
+}
+
+fn parse_prefix(s: &str) -> Result<u8> {
+    let rest = s
+        .trim()
+        .strip_prefix("C-")
+        .or_else(|| s.trim().strip_prefix("c-"))
+        .or_else(|| s.trim().strip_prefix("Ctrl-"))
+        .or_else(|| s.trim().strip_prefix("ctrl-"))
+        .ok_or_else(|| anyhow::anyhow!("expected form 'C-<key>', got '{s}'"))?;
+    let mut chars = rest.chars();
+    let c = chars
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty key after 'C-'"))?;
+    if chars.next().is_some() {
+        bail!("expected single key after 'C-', got '{rest}'");
+    }
+    match c {
+        'a'..='z' => Ok((c as u8) - b'a' + 1),
+        'A'..='Z' => Ok((c as u8) - b'A' + 1),
+        '\\' => Ok(0x1c),
+        ']' => Ok(0x1d),
+        '^' => Ok(0x1e),
+        '_' => Ok(0x1f),
+        _ => bail!("unsupported prefix key '{c}'"),
+    }
+}
+
+fn prefix_display(prefix: u8) -> String {
+    match prefix {
+        1..=26 => format!("Ctrl-{}", (b'A' + prefix - 1) as char),
+        0x1c => "Ctrl-\\".into(),
+        0x1d => "Ctrl-]".into(),
+        0x1e => "Ctrl-^".into(),
+        0x1f => "Ctrl-_".into(),
+        b => format!("0x{b:02x}"),
+    }
+}
+
+#[derive(Default)]
+struct FilterOutput {
+    forward: Vec<u8>,
+    detach: bool,
+}
+
+// InputFilter is a two-state machine over the stdin byte stream. When it
+// sees the prefix byte it consumes the next byte as a chord command:
+//
+//   <prefix> d         → emit Detach
+//   <prefix> <prefix>  → forward a single literal prefix byte
+//   <prefix> <other>   → swallow (matches tmux / screen behaviour)
+//
+// State persists across buffers — the prefix and its command can straddle
+// two reads from stdin without issue.
+struct InputFilter {
+    prefix: u8,
+    in_chord: bool,
+}
+
+impl InputFilter {
+    fn new(prefix: u8) -> Self {
+        Self {
+            prefix,
+            in_chord: false,
+        }
+    }
+
+    fn process(&mut self, data: &[u8]) -> FilterOutput {
+        let mut out = FilterOutput::default();
+        out.forward.reserve(data.len());
+        for &b in data {
+            if self.in_chord {
+                self.in_chord = false;
+                if b == CMD_DETACH {
+                    out.detach = true;
+                    return out;
+                } else if b == self.prefix {
+                    out.forward.push(self.prefix);
+                }
+                // anything else is swallowed
+            } else if b == self.prefix {
+                self.in_chord = true;
+            } else {
+                out.forward.push(b);
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_prefix_letters() {
+        assert_eq!(parse_prefix("C-a").unwrap(), 0x01);
+        assert_eq!(parse_prefix("C-b").unwrap(), 0x02);
+        assert_eq!(parse_prefix("ctrl-z").unwrap(), 0x1a);
+        assert_eq!(parse_prefix("Ctrl-A").unwrap(), 0x01);
+    }
+
+    #[test]
+    fn parse_prefix_punctuation() {
+        assert_eq!(parse_prefix("C-\\").unwrap(), 0x1c);
+        assert_eq!(parse_prefix("C-]").unwrap(), 0x1d);
+    }
+
+    #[test]
+    fn parse_prefix_rejects_garbage() {
+        assert!(parse_prefix("").is_err());
+        assert!(parse_prefix("a").is_err());
+        assert!(parse_prefix("C-").is_err());
+        assert!(parse_prefix("C-ab").is_err());
+        assert!(parse_prefix("C-1").is_err());
+    }
+
+    #[test]
+    fn filter_passes_normal_input() {
+        let mut f = InputFilter::new(0x01);
+        let out = f.process(b"hello");
+        assert_eq!(out.forward, b"hello");
+        assert!(!out.detach);
+    }
+
+    #[test]
+    fn filter_detects_chord_detach() {
+        let mut f = InputFilter::new(0x01);
+        let out = f.process(&[b'a', 0x01, b'd']);
+        assert_eq!(out.forward, b"a");
+        assert!(out.detach);
+    }
+
+    #[test]
+    fn filter_passes_literal_prefix_on_double() {
+        let mut f = InputFilter::new(0x01);
+        let out = f.process(&[0x01, 0x01, b'x']);
+        assert_eq!(out.forward, &[0x01, b'x']);
+        assert!(!out.detach);
+    }
+
+    #[test]
+    fn filter_swallows_unknown_chord() {
+        let mut f = InputFilter::new(0x01);
+        let out = f.process(&[b'a', 0x01, b'z', b'b']);
+        assert_eq!(out.forward, b"ab");
+        assert!(!out.detach);
+    }
+
+    #[test]
+    fn filter_state_spans_buffers() {
+        let mut f = InputFilter::new(0x01);
+        let out1 = f.process(&[b'x', 0x01]);
+        assert_eq!(out1.forward, b"x");
+        assert!(!out1.detach);
+        let out2 = f.process(b"d");
+        assert!(out2.forward.is_empty());
+        assert!(out2.detach);
+    }
+
+    #[test]
+    fn filter_stops_consuming_after_detach() {
+        let mut f = InputFilter::new(0x01);
+        // Any bytes after the detach command in the same buffer are
+        // dropped — we're disconnecting anyway.
+        let out = f.process(&[0x01, b'd', b'z', b'z']);
+        assert!(out.forward.is_empty());
+        assert!(out.detach);
+    }
 }

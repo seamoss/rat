@@ -37,7 +37,8 @@ fn append_read_reopen_preserves_seq() {
     assert_eq!(events[0].seq, 0);
     assert_eq!(events[2].seq, 2);
 
-    log.append(Event::SessionEnded { exit_code: Some(0) }).unwrap();
+    log.append(Event::SessionEnded { exit_code: Some(0) })
+        .unwrap();
     let tail = log.read_from(3).unwrap();
     assert_eq!(tail.len(), 1);
     assert!(matches!(

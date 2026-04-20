@@ -223,8 +223,8 @@ we asked for the snapshot. Dropping those from the broadcast stream is safe.
                      │
    rat attach ──────▶│  (additional clients, any time)
                      │
-   Ctrl-\ (in any)   │  → client sends ClientMsg::Detach,
-                     │    disconnects, daemon keeps running
+   <prefix> d        │  → client sends ClientMsg::Detach,
+   (default Ctrl-A)  │    disconnects, daemon keeps running
                      │
    rat kill  ───SIGTERM──▶ daemon → SIGTERM to PTY child
                      │  → child exits
@@ -359,6 +359,29 @@ it. In the multi-attach case, each client only sees the PTY output
 is configured for that). This keeps the wire simpler but means typing in
 one client isn't seen directly by the other — only the results are. We'll
 revisit for proper pair-programming UX.
+
+### Why a prefix chord for detach, not a single key?
+
+The first cut used a single byte (`Ctrl-\`, 0x1c) scanned out of the stdin
+stream before forwarding to the PTY. That works fine for plain shells but
+fails as soon as an inner TUI enables a keyboard-encoding protocol — kitty's
+CSI-u (`CSI > 1u`) or xterm's modifyOtherKeys. Under those protocols every
+keypress, including `Ctrl-<anything>`, is re-emitted as a multi-byte CSI
+sequence by the local terminal emulator. The client's byte-equality scan
+never sees `0x1c` again, and detach is effectively unreachable until the
+TUI exits and restores legacy encoding.
+
+A prefix chord (default `Ctrl-A` then `d`, `screen`-style) sidesteps the
+problem two ways. First, the command key (`d`) is an ordinary letter whose
+encoding is stable across all protocols we care about. Second, even if the
+prefix byte itself is re-encoded, the state machine only needs to recognize
+*some* distinguishable form of the prefix — we can extend the filter later
+to match CSI-u encodings of the same chord without widening the design.
+
+The tradeoff is one extra keypress per detach and an `RAT_PREFIX` env knob
+for users with conflicting muscle memory. The chord lives in
+`InputFilter` in `src/bin/rat.rs`; see its `process()` doc comment for the
+state machine.
 
 ### Why `setsid` over the classic double-fork daemonize?
 
