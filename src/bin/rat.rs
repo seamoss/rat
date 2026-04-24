@@ -35,6 +35,13 @@ const CMD_KILL: u8 = b'D';
 const CMD_NEW: u8 = b'c';
 const CMD_SWITCH: u8 = b's';
 const CMD_HELP: u8 = b'?';
+const CMD_COPY: u8 = b'[';
+
+// Default size of the client-side scrollback ring used by copy mode.
+// Overridable via RAT_SCROLLBACK_BYTES. Cap matters less than it used
+// to because the full transcript also lives in the daemon's log file —
+// this buffer is just what copy mode can scroll without hitting disk.
+const SCROLLBACK_CAP_DEFAULT: usize = 1_048_576; // 1 MiB
 
 // Meta-prefix flush timeout. A bare ESC has to be delivered to the inner
 // app eventually (vim's <Esc> etc.); we wait this long for a follow-up
@@ -673,10 +680,25 @@ async fn attach(session_id: SessionId, force: bool) -> Result<PostAttach> {
     let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exit_code = Arc::new(std::sync::Mutex::new(None::<i32>));
 
-    // output_task: daemon → stdout
+    // Copy-mode shared state. The scrollback ring is appended to on every
+    // filtered PtyOutput chunk; when copy mode is active the output task
+    // diverts new bytes into `pending` instead of writing to stdout, and
+    // `run_copy_mode` flushes `pending` on exit so the live view catches
+    // up with whatever the shell produced while the user was scrolling.
+    let scrollback_cap = scrollback_cap();
+    let scrollback = Arc::new(std::sync::Mutex::new(
+        std::collections::VecDeque::<u8>::with_capacity(scrollback_cap.min(4096)),
+    ));
+    let in_copy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pending = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+    // output_task: daemon → stdout (or → pending while in copy mode)
     let done_o = Arc::clone(&done);
     let ended_o = Arc::clone(&ended);
     let exit_code_o = Arc::clone(&exit_code);
+    let scrollback_o = Arc::clone(&scrollback);
+    let in_copy_o = Arc::clone(&in_copy);
+    let pending_o = Arc::clone(&pending);
     let passthrough_kbd = kbd_passthrough_enabled();
     let output_task = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -690,10 +712,18 @@ async fn attach(session_id: SessionId, force: bool) -> Result<PostAttach> {
                 DaemonMsg::Event { event } => match event.event {
                     Event::PtyOutput { data } => {
                         let filtered = filter.process(&data);
-                        if !filtered.is_empty() && stdout.write_all(&filtered).await.is_err() {
-                            break;
+                        if filtered.is_empty() {
+                            continue;
                         }
-                        let _ = stdout.flush().await;
+                        append_scrollback(&scrollback_o, &filtered, scrollback_cap);
+                        if in_copy_o.load(std::sync::atomic::Ordering::SeqCst) {
+                            pending_o.lock().unwrap().extend_from_slice(&filtered);
+                        } else {
+                            if stdout.write_all(&filtered).await.is_err() {
+                                break;
+                            }
+                            let _ = stdout.flush().await;
+                        }
                     }
                     Event::SessionEnded { exit_code: code } => {
                         ended_o.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -739,6 +769,9 @@ async fn attach(session_id: SessionId, force: bool) -> Result<PostAttach> {
     let post_i = Arc::clone(&post);
     let w_i = Arc::clone(&w);
     let done_i = Arc::clone(&done);
+    let scrollback_i = Arc::clone(&scrollback);
+    let in_copy_i = Arc::clone(&in_copy);
+    let pending_i = Arc::clone(&pending);
     let input_task = tokio::spawn(async move {
         let mut filter = InputFilter::new(prefix);
         loop {
@@ -777,6 +810,9 @@ async fn attach(session_id: SessionId, force: bool) -> Result<PostAttach> {
             let action = filter.process(&data);
             if action.help {
                 print_chord_help_inline();
+            }
+            if action.copy_mode {
+                run_copy_mode(&scrollback_i, &in_copy_i, &pending_i, &mut stdin_rx).await;
             }
             if !action.forward.is_empty()
                 && protocol::write_frame(
@@ -1234,7 +1270,7 @@ fn print_attach_banner(session_id: &str, name: Option<&str>, prefix: Prefix) {
     eprintln!(
         "{}",
         frame_row(&format!(
-            "   chord:    {BOLD}d{RESET}=detach {BOLD}c{RESET}=new {BOLD}s{RESET}=switch {BOLD}D{RESET}=kill {BOLD}?{RESET}=help"
+            "   chord:    {BOLD}d{RESET}=detach {BOLD}c{RESET}=new {BOLD}s{RESET}=switch {BOLD}D{RESET}=kill {BOLD}[{RESET}=copy {BOLD}?{RESET}=help"
         ))
     );
     // Literal-prefix echo only exists for byte prefixes.
@@ -1447,10 +1483,213 @@ fn kill_after_detach(id: SessionId) -> Result<()> {
 fn print_chord_help_inline() {
     eprint!(
         "\r\n{ORANGE}▸ rat chord{RESET}  \
-         d=detach  c=new  s=switch  D=kill  ?=help  \
+         d=detach  c=new  s=switch  D=kill  [=copy  ?=help  \
          {DIM}(prefix prefix = literal){RESET}\r\n"
     );
     let _ = std::io::stderr().flush();
+}
+
+// --- copy mode / scrollback ---------------------------------------------
+
+fn scrollback_cap() -> usize {
+    std::env::var("RAT_SCROLLBACK_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(SCROLLBACK_CAP_DEFAULT)
+}
+
+fn append_scrollback(
+    buf: &std::sync::Mutex<std::collections::VecDeque<u8>>,
+    data: &[u8],
+    cap: usize,
+) {
+    let mut b = buf.lock().unwrap();
+    b.extend(data.iter().copied());
+    while b.len() > cap {
+        b.pop_front();
+    }
+}
+
+// Quick CSI-aware ANSI stripper for copy-mode rendering. Keeps text,
+// newlines, tabs; drops CSI sequences and single-byte ESC escapes.
+// Copy mode strips everything (not just clears/moves) because rendering
+// raw cursor-movement in the alt-screen would scramble the scrollback
+// view. Colors are the price we pay; grep's ANSI stripper is reused
+// conceptually here but kept local to avoid a tangled dependency.
+fn strip_ansi_for_view(data: &[u8]) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0x1b {
+            i += 1;
+            if i < data.len() && data[i] == b'[' {
+                i += 1;
+                while i < data.len() && !(0x40..=0x7e).contains(&data[i]) {
+                    i += 1;
+                }
+                if i < data.len() {
+                    i += 1;
+                }
+            } else if i < data.len() {
+                i += 1;
+            }
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// Copy mode: alt-screen scrollback viewer. Triggered by `<prefix> [`.
+// Holds output_task's writes in the `pending` buffer while we render;
+// on exit, the alt-screen pops back to the live view and we flush
+// `pending` so the live screen catches up with anything the shell
+// produced during scrolling.
+async fn run_copy_mode(
+    scrollback: &Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+    in_copy: &Arc<std::sync::atomic::AtomicBool>,
+    pending: &Arc<std::sync::Mutex<Vec<u8>>>,
+    stdin_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    use std::sync::atomic::Ordering;
+
+    in_copy.store(true, Ordering::SeqCst);
+
+    let raw: Vec<u8> = scrollback.lock().unwrap().iter().copied().collect();
+    let stripped = strip_ansi_for_view(&raw);
+    let lines: Vec<&str> = stripped.lines().collect();
+    let total = lines.len();
+
+    // Alt-screen in, hide cursor. Helper locks + releases stdout per call
+    // so no StdoutLock crosses an .await (the async state machine needs
+    // all held guards to be Send).
+    write_stdout_sync(b"\x1b[?1049h\x1b[?25l");
+
+    let (cols, term_rows) = terminal::size().unwrap_or((80, 24));
+    let view_rows: usize = (term_rows as usize).saturating_sub(1).max(1);
+    let max_top = total.saturating_sub(view_rows);
+    let mut top: usize = max_top;
+
+    render_copy_view(&lines, top, view_rows, term_rows, cols, total);
+
+    'outer: loop {
+        let Some(bytes) = stdin_rx.recv().await else {
+            break;
+        };
+        let mut moved = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match b {
+                b'q' => break 'outer,
+                0x1b => {
+                    // ESC [ X arrow / page keys (same-buffer case) or
+                    // bare ESC (exit). Split across reads isn't handled
+                    // — edge case for MVP.
+                    if i + 2 < bytes.len() && bytes[i + 1] == b'[' {
+                        match bytes[i + 2] {
+                            b'A' => {
+                                top = top.saturating_sub(1);
+                                moved = true;
+                            }
+                            b'B' => {
+                                top = (top + 1).min(max_top);
+                                moved = true;
+                            }
+                            b'5' => {
+                                top = top.saturating_sub(view_rows);
+                                moved = true;
+                            }
+                            b'6' => {
+                                top = (top + view_rows).min(max_top);
+                                moved = true;
+                            }
+                            _ => {}
+                        }
+                        i += 3;
+                        continue;
+                    } else {
+                        break 'outer;
+                    }
+                }
+                b'j' => {
+                    top = (top + 1).min(max_top);
+                    moved = true;
+                }
+                b'k' => {
+                    top = top.saturating_sub(1);
+                    moved = true;
+                }
+                b' ' | 0x06 /* Ctrl-F */ => {
+                    top = (top + view_rows).min(max_top);
+                    moved = true;
+                }
+                b'b' | 0x02 /* Ctrl-B */ => {
+                    top = top.saturating_sub(view_rows);
+                    moved = true;
+                }
+                b'g' => {
+                    top = 0;
+                    moved = true;
+                }
+                b'G' => {
+                    top = max_top;
+                    moved = true;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if moved {
+            render_copy_view(&lines, top, view_rows, term_rows, cols, total);
+        }
+    }
+
+    // Alt-screen out, cursor back, flush pending live output.
+    let pending_bytes: Vec<u8> = std::mem::take(&mut *pending.lock().unwrap());
+    let mut restore = Vec::with_capacity(pending_bytes.len() + 16);
+    restore.extend_from_slice(b"\x1b[?25h\x1b[?1049l");
+    restore.extend_from_slice(&pending_bytes);
+    write_stdout_sync(&restore);
+
+    in_copy.store(false, Ordering::SeqCst);
+}
+
+fn write_stdout_sync(bytes: &[u8]) {
+    use std::io::Write as _;
+    let mut so = std::io::stdout().lock();
+    let _ = so.write_all(bytes);
+    let _ = so.flush();
+}
+
+fn render_copy_view(
+    lines: &[&str],
+    top: usize,
+    view_rows: usize,
+    term_rows: u16,
+    cols: u16,
+    total: usize,
+) {
+    let mut out: Vec<u8> = Vec::with_capacity(4096);
+    out.extend_from_slice(b"\x1b[H\x1b[2J");
+    let end = (top + view_rows).min(total);
+    for line in &lines[top..end] {
+        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    let status = format!(
+        " rat copy-mode  {end:>5}/{total:<5}  [j/k=line  space/b=page  g/G=top/bot  q=quit] "
+    );
+    let pad = (cols as usize).saturating_sub(visible_len(&status));
+    let goto = format!("\x1b[{term_rows};1H");
+    out.extend_from_slice(goto.as_bytes());
+    out.extend_from_slice(b"\x1b[7m");
+    out.extend_from_slice(status.as_bytes());
+    out.extend_from_slice(&vec![b' '; pad]);
+    out.extend_from_slice(b"\x1b[0m");
+    write_stdout_sync(&out);
 }
 
 // --- detach chord --------------------------------------------------------
@@ -1564,6 +1803,10 @@ struct FilterOutput {
     // The chord invoked the in-band help cheatsheet. The session continues;
     // the client just prints the line to stderr.
     help: bool,
+    // The chord asked to enter copy mode. Non-terminal: the input task
+    // enters the scrollback viewer inline and returns to normal forwarding
+    // when it exits.
+    copy_mode: bool,
     action: ChordAction,
 }
 
@@ -1689,6 +1932,11 @@ impl InputFilter {
                         // Help is non-terminal: keep consuming the rest
                         // of the buffer so the user can chain commands
                         // (e.g. `? d` to peek at help then detach).
+                    }
+                    CMD_COPY => {
+                        out.copy_mode = true;
+                        // Also non-terminal — the input task drops into
+                        // the scrollback viewer inline and resumes after.
                     }
                     _ => {
                         // Literal prefix echo only makes sense for byte

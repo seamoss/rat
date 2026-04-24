@@ -314,6 +314,7 @@ and `tmux`. Default prefix is `Ctrl-A`. Inside an attached session:
 | `Ctrl-A` then `c`     | Detach, spawn a fresh session, and attach to it              |
 | `Ctrl-A` then `s`     | Detach and open the session switcher (picker)                |
 | `Ctrl-A` then `D`     | Detach and kill the session (prompts to confirm)             |
+| `Ctrl-A` then `[`     | Enter copy mode: scroll the client-side scrollback buffer    |
 | `Ctrl-A` then `?`     | Print the chord cheatsheet in-band (session keeps running)   |
 | `Ctrl-A` `Ctrl-A`     | Send a literal `Ctrl-A` through to the inner program         |
 | `Ctrl-D`              | Normal shell EOF — exits the shell and ends the session      |
@@ -325,6 +326,30 @@ command (e.g., `Ctrl-A x`) is silently swallowed.
 `<prefix> s` detaches the current session, shows the picker, and attaches
 whichever you pick. `<prefix> c` detaches and immediately attaches to a
 fresh session.
+
+### Copy mode
+
+`<prefix> [` enters a read-only scrollback viewer on the alternate screen.
+While it's up, live output from the shell keeps arriving in the
+background and gets flushed to the main screen as soon as you exit.
+
+Keys inside copy mode:
+
+| Key                     | Action                                             |
+| ----------------------- | -------------------------------------------------- |
+| `j` / `↓`               | Scroll one line down (toward newer output)         |
+| `k` / `↑`               | Scroll one line up (toward older output)           |
+| `Space` / `PgDn` / `^F` | Page down                                          |
+| `b`    / `PgUp` / `^B`  | Page up                                            |
+| `g`                     | Jump to oldest line in the buffer                  |
+| `G`                     | Jump to newest line (bottom)                       |
+| `q` / `Esc`             | Exit copy mode; main screen catches up to live     |
+
+The buffer is client-side and capped at 1 MiB by default. Override
+with `RAT_SCROLLBACK_BYTES=<n>` before `rat attach`. ANSI escape
+sequences are stripped for rendering stability — copy mode trades
+colour fidelity for predictable line navigation. If you want a
+coloured-transcript search instead, use `rat grep` against the log.
 
 ### Why a chord, not a single key?
 
