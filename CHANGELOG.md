@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/seamoss/rat/compare/rat-v0.4.0...rat-v0.4.1) (2026-04-24)
+
+
+### Bug Fixes
+
+* **ci:** use \$name in archive template for multi-binary packaging ([cd7071b](https://github.com/seamoss/rat/commit/cd7071bd2dd796b0b1b8e9318cbb54f848a6848a))
+* **ci:** use $name in archive template for multi-binary packaging ([9c82a2d](https://github.com/seamoss/rat/commit/9c82a2d5f7a5ba10030a89720d9f29f9f3fa090c))
+
 ## [0.4.0](https://github.com/seamoss/rat/compare/rat-v0.3.0...rat-v0.4.0) (2026-04-24)
 
 
