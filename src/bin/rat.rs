@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self as ct_event, KeyCode, KeyModifiers};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
@@ -124,6 +124,13 @@ enum Cmd {
         /// New alias. Must be unique among live sessions.
         alias: String,
     },
+    /// Print a shell completion script to stdout. `eval` it, or drop it in
+    /// the shell's completion directory for persistent tab-completion.
+    Completions {
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[tokio::main]
@@ -149,7 +156,15 @@ async fn main() -> Result<()> {
         Some(Cmd::Killall { yes }) => killall(yes),
         Some(Cmd::Rename { id, new_name }) => rename(&id, &new_name),
         Some(Cmd::Alias { id, alias }) => add_alias(&id, &alias),
+        Some(Cmd::Completions { shell }) => completions(shell),
     }
+}
+
+fn completions(shell: clap_complete::Shell) -> Result<()> {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+    Ok(())
 }
 
 fn kill(query: &str, yes: bool) -> Result<()> {

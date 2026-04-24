@@ -24,6 +24,7 @@ path = "src/bin/rat.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = { version = "0.28", features = ["event-stream"] }
 libc = "0.2"
 portable-pty = "0.8"
