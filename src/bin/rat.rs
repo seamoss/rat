@@ -153,6 +153,21 @@ enum Cmd {
         /// Session name, alias, UUID, or UUID prefix.
         id: String,
     },
+    /// Resurrect a dead session: spin up a fresh daemon whose event log
+    /// is pre-seeded with the old session's PtyOutput, then attach. The
+    /// shell is new (the original PTY is long gone) but the scrollback
+    /// is what you left behind.
+    Resurrect {
+        /// Path to a .log file, or a session name / UUID / UUID prefix
+        /// (resolved via the meta file for dead sessions still on disk).
+        source: String,
+        /// Optional name for the new session.
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Skip the nested-session warning.
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -189,6 +204,11 @@ async fn main() -> Result<()> {
             let session_id = resolve_session(&id)?;
             watch(session_id).await
         }
+        Some(Cmd::Resurrect {
+            source,
+            name,
+            force,
+        }) => resurrect(&source, name, force).await,
     }
 }
 
@@ -312,6 +332,34 @@ fn strip_ansi(data: &[u8]) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+// Resurrect: seed a fresh daemon with the PtyOutput from an old log and
+// attach. The original PTY process is gone, but replaying its bytes into
+// the new session's scrollback reconstructs what the user was looking at
+// when it died — which is usually the only thing they miss.
+async fn resurrect(source: &str, name: Option<String>, force: bool) -> Result<()> {
+    let seed_path = resolve_log_source(source)?;
+    warn_if_nested(force)?;
+    let session_id = spawn_daemon_with_seed(name, Vec::new(), Some(seed_path)).await?;
+    run_attach_cycle(session_id, true).await
+}
+
+// Accept either a path to a .log file or a session label/id. For labels
+// we look up the meta (works for dead sessions too — the meta file is
+// only removed on clean shutdown via cleanup_stale).
+fn resolve_log_source(source: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(source);
+    if path.is_file() {
+        return Ok(path);
+    }
+    let meta = read_all_metas()?
+        .into_iter()
+        .find(|m| meta_has_label(m, source) || m.id.to_string().starts_with(source))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no log file or session matching '{source}' (pass a .log path directly if the meta is gone)")
+        })?;
+    Ok(meta.log_path)
 }
 
 fn kill(query: &str, yes: bool) -> Result<()> {
@@ -668,8 +716,17 @@ async fn spawn_bare(force: bool) -> Result<()> {
 }
 
 // Fork rat-daemon into its own session and wait until it's bound the
-// Unix socket. Returns the session id on success.
+// Unix socket. Returns the session id on success. `seed_log`, when set,
+// is forwarded as the daemon's `--seed-log` flag (see `rat resurrect`).
 async fn spawn_daemon(name: Option<String>, cmd: Vec<String>) -> Result<SessionId> {
+    spawn_daemon_with_seed(name, cmd, None).await
+}
+
+async fn spawn_daemon_with_seed(
+    name: Option<String>,
+    cmd: Vec<String>,
+    seed_log: Option<PathBuf>,
+) -> Result<SessionId> {
     if let Some(n) = &name {
         if n.is_empty() {
             bail!("--name must not be empty");
@@ -713,6 +770,9 @@ async fn spawn_daemon(name: Option<String>, cmd: Vec<String>) -> Result<SessionI
         .arg(rows.to_string());
     if let Some(n) = &name {
         builder.arg("--name").arg(n);
+    }
+    if let Some(seed) = &seed_log {
+        builder.arg("--seed-log").arg(seed);
     }
     if !cmd.is_empty() {
         builder.arg("--");

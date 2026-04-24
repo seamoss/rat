@@ -282,6 +282,35 @@ wait before escalating holdouts to SIGKILL. If you're currently inside
 a rat session when you run this, the prompt calls that out — you're
 about to kill the daemon under your own feet.
 
+### `rat resurrect SOURCE [-n, --name NAME] [-f, --force]`
+
+Spin up a fresh daemon whose event log is pre-seeded with an old
+session's `PtyOutput`, then attach. The original PTY is long gone, so
+the new shell is fresh — but the scrollback you left behind is
+replayed into place, followed by a yellow `-- rat resurrect:
+previous session replayed above --` separator and the live prompt.
+
+`SOURCE` is either:
+- a `.log` file path (absolute or relative), or
+- a session name / alias / UUID / UUID prefix that still has a
+  meta file on disk (dead sessions qualify — metas are only removed
+  by clean shutdown or `rat kill`).
+
+```sh
+# By path — works even if the meta is gone
+rat resurrect ~/.local/state/rat/<uuid>.log
+
+# By name — resolves via the still-present meta
+rat resurrect agent
+
+# Name the resurrected session differently
+rat resurrect agent -n agent-ii
+```
+
+What you get back: visual history. What you don't: the old process,
+the old environment, the old working directory. Resurrect rebuilds
+"what I was looking at," not "what I was running."
+
 ### `rat replay LOG_PATH`
 
 Non-interactive playback of a session log file (the
