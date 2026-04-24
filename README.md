@@ -73,7 +73,27 @@ a full TUI with panes. See [Roadmap](#roadmap).
 
 ## Install
 
-Rat is pre-release; build from source.
+### One-liner (prebuilt binaries)
+
+```sh
+curl -sSfL https://raw.githubusercontent.com/seamoss/rat/dev/install.sh | sh
+```
+
+Detects your OS + arch, pulls the latest release tarball from GitHub,
+and drops `rat` + `rat-daemon` into `~/.local/bin`. Supported targets:
+`x86_64` / `aarch64` on Linux (glibc) and macOS.
+
+Overrides:
+
+```sh
+# Install a specific version
+RAT_VERSION=rat-v0.3.0 curl -sSfL https://raw.githubusercontent.com/seamoss/rat/dev/install.sh | sh
+
+# Install somewhere else
+RAT_PREFIX_INSTALL=/usr/local/bin curl -sSfL https://raw.githubusercontent.com/seamoss/rat/dev/install.sh | sudo sh
+```
+
+### From source
 
 **Requirements:** Rust 1.80+ (`edition = "2024"` in `Cargo.toml`),
 a Unix-like OS (Linux or macOS). Windows is not currently supported.
