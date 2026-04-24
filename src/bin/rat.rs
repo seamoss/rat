@@ -146,6 +146,13 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
+    /// Read-only passive observation of a live session. Replays then
+    /// tails the output stream. No input forwarded, no resize sent —
+    /// the attached interactive client is untouched. Ctrl-C to stop.
+    Watch {
+        /// Session name, alias, UUID, or UUID prefix.
+        id: String,
+    },
 }
 
 #[tokio::main]
@@ -178,6 +185,10 @@ async fn main() -> Result<()> {
             log,
             raw,
         }) => grep(&pattern, session.as_deref(), log.as_deref(), raw),
+        Some(Cmd::Watch { id }) => {
+            let session_id = resolve_session(&id)?;
+            watch(session_id).await
+        }
     }
 }
 
@@ -1002,6 +1013,122 @@ async fn run_attach_cycle(mut id: SessionId, force: bool) -> Result<()> {
             }
         }
     }
+}
+
+// Read-only attach. Connects the same way a normal client does, replays
+// the log from seq 0, and streams PtyOutput to stdout. Never sends
+// ClientMsg::Input, ClientMsg::Detach, or ClientMsg::Resize, so the
+// interactive attacher (if any) is unaffected. Stays in cooked mode so
+// Ctrl-C from the terminal line discipline cleanly ends the watch.
+async fn watch(session_id: SessionId) -> Result<()> {
+    let sock = paths::sock_path(&session_id.to_string());
+    let stream = UnixStream::connect(&sock)
+        .await
+        .with_context(|| format!("connect {}", sock.display()))?;
+
+    let (r, w) = stream.into_split();
+    let mut r = BufReader::new(r);
+    let mut w = w;
+
+    protocol::write_frame(&mut w, &ClientMsg::Attach { from_seq: 0 }).await?;
+
+    let first: DaemonMsg = protocol::read_frame(&mut r).await?;
+    let (sid, sname) = match first {
+        DaemonMsg::Attached {
+            session_id, name, ..
+        } => (session_id, name),
+        DaemonMsg::Error { message } => bail!("daemon error: {message}"),
+        _ => bail!("expected Attached first"),
+    };
+
+    print_watch_banner(&sid, sname.as_deref());
+
+    let stop = Arc::new(Notify::new());
+    let stop_c = Arc::clone(&stop);
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        stop_c.notify_one();
+    });
+
+    let passthrough_kbd = kbd_passthrough_enabled();
+    let mut filter = OutputFilter::new(passthrough_kbd);
+    let mut stdout = tokio::io::stdout();
+    let mut ended_code: Option<Option<i32>> = None;
+
+    loop {
+        tokio::select! {
+            _ = stop.notified() => break,
+            msg = protocol::read_frame::<_, DaemonMsg>(&mut r) => {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+                match msg {
+                    DaemonMsg::Event { event } => match event.event {
+                        Event::PtyOutput { data } => {
+                            let filtered = filter.process(&data);
+                            if !filtered.is_empty()
+                                && stdout.write_all(&filtered).await.is_err()
+                            {
+                                break;
+                            }
+                            let _ = stdout.flush().await;
+                        }
+                        Event::SessionEnded { exit_code: code } => {
+                            ended_code = Some(code);
+                            break;
+                        }
+                        _ => {}
+                    },
+                    DaemonMsg::SessionEnded { exit_code: code } => {
+                        ended_code = Some(code);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(code) = ended_code {
+        print_session_ended(&sid, sname.as_deref(), code);
+    } else {
+        eprintln!();
+        eprintln!("— watch stopped for {} —", sname.as_deref().unwrap_or(&sid));
+    }
+    Ok(())
+}
+
+fn print_watch_banner(session_id: &str, name: Option<&str>) {
+    let short = &session_id[..session_id.len().min(8)];
+    eprint!("\x1b]2;[rat watch] {short}\x07");
+    eprintln!();
+    eprintln!("{}", frame_top());
+    eprintln!("{}", frame_blank());
+    eprintln!(
+        "{}",
+        frame_row(&format!(
+            "   {BOLD}rat{RESET} {DIM}·{RESET} watching {DIM}(read-only){RESET}"
+        ))
+    );
+    eprintln!("{}", frame_blank());
+    eprintln!(
+        "{}",
+        frame_row(&format!(
+            "   session:  {BOLD}{session_id}{RESET}{}",
+            name.map(|n| format!(" {DIM}({n}){RESET}"))
+                .unwrap_or_default()
+        ))
+    );
+    eprintln!(
+        "{}",
+        frame_row(&format!(
+            "   {DIM}(Ctrl-C to stop · no input forwarded to the session){RESET}"
+        ))
+    );
+    eprintln!("{}", frame_blank());
+    eprintln!("{}", frame_bot());
+    eprintln!();
 }
 
 fn list_text() -> Result<()> {
