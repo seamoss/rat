@@ -1,8 +1,25 @@
 name: release-please
 
+# Runs release-please on every push to dev, then — in the same workflow
+# invocation — cross-builds rat + rat-daemon and attaches the tarballs to
+# the release release-please just cut. The binary build MUST live in the
+# same workflow as release-please: GitHub deliberately does not re-trigger
+# workflows from events caused by the default GITHUB_TOKEN, so a separate
+# `on: release: published` workflow would never fire for a release cut by
+# this one.
+#
+# workflow_dispatch lets us retroactively upload binaries to an existing
+# release by passing its tag (e.g. rat-v0.3.0).
+
 on:
   push:
     branches: [dev]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to (re-)upload binaries for, e.g. rat-v0.3.0. Leave empty for the normal release-please flow."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -10,10 +27,48 @@ permissions:
 
 jobs:
   release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           target-branch: dev
+
+  upload-binaries:
+    needs: [release-please]
+    if: |
+      always() && (
+        (github.event_name == 'push' && needs.release-please.outputs.release_created == 'true') ||
+        (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+      )
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: rat,rat-daemon
+          target: ${{ matrix.target }}
+          tar: unix
+          archive: $bin-$tag-$target
+          ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || needs.release-please.outputs.tag_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
