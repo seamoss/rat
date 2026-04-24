@@ -26,9 +26,21 @@ use tokio::sync::{Notify, mpsc};
 // degrades less often: even if the prefix gets re-encoded by the TUI, the
 // follow-up command key still uniquely identifies an intent. Default
 // `Ctrl-A` matches `screen`'s long-standing convention; users can override
-// via `RAT_PREFIX`.
-const DEFAULT_PREFIX: u8 = 0x01; // Ctrl-A
+// via `RAT_PREFIX` (e.g. `C-Space`, `M-a`).
+const DEFAULT_PREFIX: Prefix = Prefix::Byte(0x01); // Ctrl-A
+
+// Chord commands (the byte after the prefix).
 const CMD_DETACH: u8 = b'd';
+const CMD_KILL: u8 = b'D';
+const CMD_NEW: u8 = b'c';
+const CMD_SWITCH: u8 = b's';
+const CMD_HELP: u8 = b'?';
+
+// Meta-prefix flush timeout. A bare ESC has to be delivered to the inner
+// app eventually (vim's <Esc> etc.); we wait this long for a follow-up
+// byte before giving up and forwarding the ESC. Matches the common
+// xterm/vim "esc-timeout" convention.
+const META_FLUSH_MS: u64 = 50;
 
 #[derive(Parser)]
 #[command(
@@ -92,6 +104,12 @@ enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Kill every live session and sweep any stale daemon state. Prompts.
+    Killall {
+        /// Skip the confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Rename a live session (changes the primary name).
     Rename {
         /// Current name, alias, UUID, or UUID prefix.
@@ -116,7 +134,7 @@ async fn main() -> Result<()> {
         Some(Cmd::New { name, cmd, force }) => new(name, cmd, force).await,
         Some(Cmd::Attach { id, force }) => {
             let session_id = resolve_session(&id)?;
-            attach(session_id, force).await
+            run_attach_cycle(session_id, force).await
         }
         Some(Cmd::List { force }) => {
             if std::io::stdout().is_terminal() {
@@ -128,6 +146,7 @@ async fn main() -> Result<()> {
         Some(Cmd::Replay { path }) => replay(&path),
         Some(Cmd::Init { shell }) => init(&shell),
         Some(Cmd::Kill { id, yes }) => kill(&id, yes),
+        Some(Cmd::Killall { yes }) => killall(yes),
         Some(Cmd::Rename { id, new_name }) => rename(&id, &new_name),
         Some(Cmd::Alias { id, alias }) => add_alias(&id, &alias),
     }
@@ -209,6 +228,110 @@ fn kill(query: &str, yes: bool) -> Result<()> {
 
     cleanup_stale(&meta);
     println!("killed session {}", meta.id.short());
+    Ok(())
+}
+
+fn killall(yes: bool) -> Result<()> {
+    let metas = read_all_metas()?;
+    if metas.is_empty() {
+        println!("no sessions");
+        return Ok(());
+    }
+
+    let (live, dead): (Vec<SessionMeta>, Vec<SessionMeta>) =
+        metas.into_iter().partition(|m| process_alive(m.pid));
+
+    if live.is_empty() {
+        // Nothing to kill — but sweep any orphaned state files.
+        for m in &dead {
+            cleanup_stale(m);
+        }
+        println!("no live sessions (swept {} stale)", dead.len());
+        return Ok(());
+    }
+
+    println!(
+        "About to kill {} live session(s){}:",
+        live.len(),
+        if dead.is_empty() {
+            String::new()
+        } else {
+            format!(" (+ sweep {} stale)", dead.len())
+        }
+    );
+    for m in &live {
+        let label = label_column(m);
+        println!(
+            "  {:<10} {:<20} pid {:<6} {}",
+            m.id.short(),
+            truncate(&label, 20),
+            m.pid,
+            m.command
+        );
+    }
+    // Flag the footgun: killing all includes the ambient session.
+    if let Ok(cur) = std::env::var("RAT_SESSION")
+        && !cur.is_empty()
+        && live.iter().any(|m| m.id.to_string() == cur)
+    {
+        let short = &cur[..cur.len().min(8)];
+        println!("NOTE: you are currently inside session {short} — killing will drop you.");
+    }
+
+    if !yes {
+        print!("Are you sure? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
+    // SIGTERM every live daemon in one pass so they shut down concurrently,
+    // then wait once for up to 2s. This is an order of magnitude faster than
+    // looping the per-session kill() path when there are many sessions.
+    for m in &live {
+        unsafe {
+            libc::kill(m.pid as i32, libc::SIGTERM);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if live.iter().all(|m| !process_alive(m.pid)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut hard_killed = 0;
+    for m in &live {
+        if process_alive(m.pid) {
+            unsafe {
+                libc::kill(m.pid as i32, libc::SIGKILL);
+            }
+            hard_killed += 1;
+        }
+    }
+    if hard_killed > 0 {
+        eprintln!("{hard_killed} daemon(s) ignored SIGTERM — escalated to SIGKILL");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    for m in live.iter().chain(dead.iter()) {
+        cleanup_stale(m);
+    }
+
+    println!(
+        "killed {} session(s){}",
+        live.len(),
+        if dead.is_empty() {
+            String::new()
+        } else {
+            format!(", swept {} stale", dead.len())
+        }
+    );
     Ok(())
 }
 
@@ -370,7 +493,7 @@ async fn new(name: Option<String>, cmd: Vec<String>, force: bool) -> Result<()> 
     warn_if_nested(force)?;
     let session_id = spawn_daemon(name, cmd).await?;
     // Already passed the nested-session check above; don't prompt again.
-    attach(session_id, true).await
+    run_attach_cycle(session_id, true).await
 }
 
 // Bare `rat` with no subcommand: spawn a detached daemon, print its id,
@@ -472,7 +595,30 @@ async fn spawn_daemon(name: Option<String>, cmd: Vec<String>) -> Result<SessionI
     Ok(session_id)
 }
 
-async fn attach(session_id: SessionId, force: bool) -> Result<()> {
+// What the client should do once the current attach has ended. Set by the
+// chord filter when the user presses a chord that's "detach then <thing>",
+// so the main loop can re-enter attach against a different session instead
+// of returning all the way to the shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostAttach {
+    None,
+    Switch,
+    NewSession,
+    Kill,
+}
+
+impl PostAttach {
+    fn from_chord(a: ChordAction) -> Self {
+        match a {
+            ChordAction::None | ChordAction::Detach => Self::None,
+            ChordAction::DetachThenSwitch => Self::Switch,
+            ChordAction::DetachThenNew => Self::NewSession,
+            ChordAction::DetachThenKill => Self::Kill,
+        }
+    }
+}
+
+async fn attach(session_id: SessionId, force: bool) -> Result<PostAttach> {
     warn_if_nested(force)?;
     // Resolve the detach prefix before we enter raw mode — a bad RAT_PREFIX
     // should surface as a normal error, not a stuck terminal.
@@ -571,13 +717,52 @@ async fn attach(session_id: SessionId, force: bool) -> Result<()> {
             }
         })?;
 
-    // input_task: channel → daemon Input, intercepting the detach chord.
+    // input_task: channel → daemon Input, intercepting the chord. A shared
+    // slot carries the post-detach action back to the main loop so we can
+    // re-attach elsewhere (switch), spawn a new session (c), or kill (D).
+    let post = Arc::new(std::sync::Mutex::new(PostAttach::None));
+    let post_i = Arc::clone(&post);
     let w_i = Arc::clone(&w);
     let done_i = Arc::clone(&done);
     let input_task = tokio::spawn(async move {
         let mut filter = InputFilter::new(prefix);
-        while let Some(data) = stdin_rx.recv().await {
+        loop {
+            // When the filter is mid-ESC (Meta-prefix path) we race the
+            // stdin recv against a short timeout so a bare ESC keypress
+            // isn't held indefinitely — vim etc. needs the ESC delivered
+            // within ~50ms of the user pressing it.
+            let data = if filter.awaiting_esc() {
+                tokio::select! {
+                    maybe = stdin_rx.recv() => match maybe {
+                        Some(d) => d,
+                        None => break,
+                    },
+                    _ = tokio::time::sleep(Duration::from_millis(META_FLUSH_MS)) => {
+                        let flushed = filter.flush();
+                        if !flushed.is_empty()
+                            && protocol::write_frame(
+                                &mut *w_i.lock().await,
+                                &ClientMsg::Input { data: flushed },
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                match stdin_rx.recv().await {
+                    Some(d) => d,
+                    None => break,
+                }
+            };
+
             let action = filter.process(&data);
+            if action.help {
+                print_chord_help_inline();
+            }
             if !action.forward.is_empty()
                 && protocol::write_frame(
                     &mut *w_i.lock().await,
@@ -590,8 +775,9 @@ async fn attach(session_id: SessionId, force: bool) -> Result<()> {
             {
                 break;
             }
-            if action.detach {
+            if action.action.detaches() {
                 let _ = protocol::write_frame(&mut *w_i.lock().await, &ClientMsg::Detach).await;
+                *post_i.lock().unwrap() = PostAttach::from_chord(action.action);
                 break;
             }
         }
@@ -627,12 +813,44 @@ async fn attach(session_id: SessionId, force: bool) -> Result<()> {
 
     drop(_raw);
 
+    let post = *post.lock().unwrap();
     if ended.load(std::sync::atomic::Ordering::SeqCst) {
         print_session_ended(&sid, sname.as_deref(), *exit_code.lock().unwrap());
-    } else {
+    } else if matches!(post, PostAttach::None) {
+        // Suppress the "detached" banner when we're about to chain into
+        // another attach / action — the next banner will take its place.
         print_detach_banner(&sid, sname.as_deref());
     }
-    Ok(())
+    Ok(post)
+}
+
+// Drives a series of attach() calls, chaining on the PostAttach action
+// returned by each one. A single `rat attach` invocation can thus walk
+// between sessions (via `<prefix> s`) or spawn-and-attach a fresh one
+// (via `<prefix> c`) without the user having to re-enter `rat`.
+async fn run_attach_cycle(mut id: SessionId, force: bool) -> Result<()> {
+    let mut first = true;
+    loop {
+        let post = attach(id, if first { force } else { true }).await?;
+        first = false;
+        match post {
+            PostAttach::None => return Ok(()),
+            PostAttach::Switch => match pick_live_session()? {
+                Some(next) => {
+                    id = next;
+                }
+                None => return Ok(()),
+            },
+            PostAttach::NewSession => {
+                let new_id = spawn_daemon(None, Vec::new()).await?;
+                id = new_id;
+            }
+            PostAttach::Kill => {
+                kill_after_detach(id)?;
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn list_text() -> Result<()> {
@@ -702,9 +920,25 @@ async fn list_pick(force: bool) -> Result<()> {
 
     if let Some(id) = selected {
         // Already confirmed — don't prompt again from inside attach().
-        attach(id, true).await?;
+        run_attach_cycle(id, true).await?;
     }
     Ok(())
+}
+
+// Picker-only variant of `list_pick`: no banner prompt, no attach. Used
+// by the `<prefix> s` chord to let the user hop between live sessions
+// without leaving the attach cycle.
+fn pick_live_session() -> Result<Option<SessionId>> {
+    let mut alive: Vec<SessionMeta> = read_all_metas()?
+        .into_iter()
+        .filter(|m| process_alive(m.pid))
+        .collect();
+    if alive.is_empty() {
+        eprintln!("no running sessions");
+        return Ok(None);
+    }
+    alive.sort_by_key(|m| m.started);
+    run_picker(&alive)
 }
 
 fn run_picker(items: &[SessionMeta]) -> Result<Option<SessionId>> {
@@ -723,10 +957,8 @@ fn run_picker(items: &[SessionMeta]) -> Result<Option<SessionId>> {
                     KeyCode::Up | KeyCode::Char('k') => {
                         cursor = cursor.saturating_sub(1);
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if cursor + 1 < items.len() {
-                            cursor += 1;
-                        }
+                    KeyCode::Down | KeyCode::Char('j') if cursor + 1 < items.len() => {
+                        cursor += 1;
                     }
                     KeyCode::Home => cursor = 0,
                     KeyCode::End => cursor = items.len().saturating_sub(1),
@@ -958,7 +1190,7 @@ fn frame_row(content: &str) -> String {
     )
 }
 
-fn print_attach_banner(session_id: &str, name: Option<&str>, prefix: u8) {
+fn print_attach_banner(session_id: &str, name: Option<&str>, prefix: Prefix) {
     let short = &session_id[..session_id.len().min(8)];
     // OSC 2: set terminal title.
     eprint!("\x1b]2;[rat] {short}\x07");
@@ -983,14 +1215,22 @@ fn print_attach_banner(session_id: &str, name: Option<&str>, prefix: u8) {
     if let Some(n) = name {
         eprintln!("{}", frame_row(&format!("   name:     {BOLD}{n}{RESET}")));
     }
-    eprintln!(
-        "{}",
-        frame_row(&format!("   detach:   {BOLD}{pd} d{RESET}"))
-    );
+    eprintln!("{}", frame_row(&format!("   prefix:   {BOLD}{pd}{RESET}")));
     eprintln!(
         "{}",
         frame_row(&format!(
-            "   {DIM}({pd} {pd} for literal · Ctrl-D / exit ends session){RESET}"
+            "   chord:    {BOLD}d{RESET}=detach {BOLD}c{RESET}=new {BOLD}s{RESET}=switch {BOLD}D{RESET}=kill {BOLD}?{RESET}=help"
+        ))
+    );
+    // Literal-prefix echo only exists for byte prefixes.
+    let literal_hint = match prefix {
+        Prefix::Byte(_) => format!("{pd} {pd} for literal · "),
+        Prefix::Meta(_) => String::new(),
+    };
+    eprintln!(
+        "{}",
+        frame_row(&format!(
+            "   {DIM}({literal_hint}Ctrl-D / exit ends session){RESET}"
         ))
     );
     eprintln!("{}", frame_blank());
@@ -1137,25 +1377,109 @@ fn warn_if_nested(force: bool) -> Result<()> {
     }
 }
 
+// Post-detach handler for `<prefix> D`. Prompts (y/N) because capital-D
+// is one Shift-slip away from plain `d` and we don't want accidental
+// session kills. Reuses the SIGTERM → 2s wait → SIGKILL → cleanup dance
+// from the normal `rat kill` path.
+fn kill_after_detach(id: SessionId) -> Result<()> {
+    let meta = read_all_metas()?
+        .into_iter()
+        .find(|m| m.id == id)
+        .ok_or_else(|| anyhow::anyhow!("no meta for session {}", id.short()))?;
+
+    print!("Kill session {}? [y/N] ", id.short());
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("aborted");
+        return Ok(());
+    }
+
+    if !process_alive(meta.pid) {
+        cleanup_stale(&meta);
+        println!("session {} was already dead — cleaned up", id.short());
+        return Ok(());
+    }
+
+    unsafe {
+        libc::kill(meta.pid as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !process_alive(meta.pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if process_alive(meta.pid) {
+        eprintln!("SIGTERM ignored after 2s — escalating to SIGKILL");
+        unsafe {
+            libc::kill(meta.pid as i32, libc::SIGKILL);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    cleanup_stale(&meta);
+    println!("killed session {}", id.short());
+    Ok(())
+}
+
+// Printed in raw mode when the user presses `<prefix> ?`. The leading
+// `\r\n` puts the line on its own row regardless of where the inner app
+// left the cursor; the trailing `\r\n` leaves the cursor at column 1 so
+// subsequent PTY output doesn't overlap. Inner apps may still need a
+// Ctrl-L to fully repaint — the trade-off for zero cursor-save gymnastics.
+fn print_chord_help_inline() {
+    eprint!(
+        "\r\n{ORANGE}▸ rat chord{RESET}  \
+         d=detach  c=new  s=switch  D=kill  ?=help  \
+         {DIM}(prefix prefix = literal){RESET}\r\n"
+    );
+    let _ = std::io::stderr().flush();
+}
+
 // --- detach chord --------------------------------------------------------
 
-fn resolve_prefix() -> Result<u8> {
+// The prefix can be either a single byte (Ctrl-<key>, including Ctrl-Space /
+// Ctrl-@ = 0x00) or an ESC+byte pair (Alt/Meta-<key>). Ctrl-form is cheap:
+// just a byte-equality scan. Meta-form needs a small state machine that
+// distinguishes `ESC <key>` (chord trigger) from `ESC [ ...` (a CSI arrow
+// key etc.) and from a lone ESC (which vim/readline need delivered).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prefix {
+    Byte(u8),
+    Meta(u8),
+}
+
+fn resolve_prefix() -> Result<Prefix> {
     match std::env::var("RAT_PREFIX") {
-        Ok(s) => {
-            parse_prefix(&s).with_context(|| format!("parse RAT_PREFIX='{s}' (expected 'C-<key>')"))
-        }
+        Ok(s) => parse_prefix(&s)
+            .with_context(|| format!("parse RAT_PREFIX='{s}' (expected 'C-<key>' or 'M-<key>')")),
         Err(_) => Ok(DEFAULT_PREFIX),
     }
 }
 
-fn parse_prefix(s: &str) -> Result<u8> {
-    let rest = s
-        .trim()
-        .strip_prefix("C-")
-        .or_else(|| s.trim().strip_prefix("c-"))
-        .or_else(|| s.trim().strip_prefix("Ctrl-"))
-        .or_else(|| s.trim().strip_prefix("ctrl-"))
-        .ok_or_else(|| anyhow::anyhow!("expected form 'C-<key>', got '{s}'"))?;
+fn parse_prefix(s: &str) -> Result<Prefix> {
+    let s = s.trim();
+    for p in ["C-", "c-", "Ctrl-", "ctrl-"] {
+        if let Some(rest) = s.strip_prefix(p) {
+            return parse_ctrl_key(rest).map(Prefix::Byte);
+        }
+    }
+    for p in ["M-", "m-", "Alt-", "alt-", "Meta-", "meta-"] {
+        if let Some(rest) = s.strip_prefix(p) {
+            return parse_meta_key(rest).map(Prefix::Meta);
+        }
+    }
+    bail!("expected form 'C-<key>' or 'M-<key>', got '{s}'")
+}
+
+fn parse_ctrl_key(rest: &str) -> Result<u8> {
+    // Case-insensitive named keys first.
+    match rest.to_ascii_lowercase().as_str() {
+        "space" | "spc" | " " | "@" => return Ok(0x00),
+        _ => {}
+    }
     let mut chars = rest.chars();
     let c = chars
         .next()
@@ -1170,69 +1494,202 @@ fn parse_prefix(s: &str) -> Result<u8> {
         ']' => Ok(0x1d),
         '^' => Ok(0x1e),
         '_' => Ok(0x1f),
-        _ => bail!("unsupported prefix key '{c}'"),
+        _ => bail!("unsupported Ctrl- key '{c}'"),
     }
 }
 
-fn prefix_display(prefix: u8) -> String {
+fn parse_meta_key(rest: &str) -> Result<u8> {
+    let mut chars = rest.chars();
+    let c = chars
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty key after 'M-'"))?;
+    if chars.next().is_some() {
+        bail!("expected single key after 'M-', got '{rest}'");
+    }
+    // Only alphanumeric Meta keys — punctuation like `M-[` would collide
+    // with the CSI introducer and break the filter's ESC-disambiguation.
+    if !c.is_ascii_alphanumeric() {
+        bail!("unsupported Meta- key '{c}' (alphanumeric only)");
+    }
+    Ok(c as u8)
+}
+
+fn prefix_display(prefix: Prefix) -> String {
     match prefix {
-        1..=26 => format!("Ctrl-{}", (b'A' + prefix - 1) as char),
-        0x1c => "Ctrl-\\".into(),
-        0x1d => "Ctrl-]".into(),
-        0x1e => "Ctrl-^".into(),
-        0x1f => "Ctrl-_".into(),
-        b => format!("0x{b:02x}"),
+        Prefix::Byte(0x00) => "Ctrl-Space".into(),
+        Prefix::Byte(b) if (1..=26).contains(&b) => format!("Ctrl-{}", (b'A' + b - 1) as char),
+        Prefix::Byte(0x1c) => "Ctrl-\\".into(),
+        Prefix::Byte(0x1d) => "Ctrl-]".into(),
+        Prefix::Byte(0x1e) => "Ctrl-^".into(),
+        Prefix::Byte(0x1f) => "Ctrl-_".into(),
+        Prefix::Byte(b) => format!("0x{b:02x}"),
+        Prefix::Meta(c) => format!("Alt-{}", c as char),
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum ChordAction {
+    #[default]
+    None,
+    Detach,
+    DetachThenKill,
+    DetachThenNew,
+    DetachThenSwitch,
+}
+
+impl ChordAction {
+    fn detaches(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+#[derive(Default, Debug)]
 struct FilterOutput {
     forward: Vec<u8>,
-    detach: bool,
+    // The chord invoked the in-band help cheatsheet. The session continues;
+    // the client just prints the line to stderr.
+    help: bool,
+    action: ChordAction,
 }
 
-// InputFilter is a two-state machine over the stdin byte stream. When it
-// sees the prefix byte it consumes the next byte as a chord command:
+enum FilterState {
+    Normal,
+    // Only used when prefix is Meta(_): we've seen an ESC and are waiting
+    // to see if the next byte matches our Meta key. If it's not a match
+    // the buffered ESC gets flushed (either on the next byte or after
+    // META_FLUSH_MS so bare ESC doesn't starve inner apps).
+    SawEsc,
+    InChord,
+}
+
+// InputFilter is a small state machine over the stdin byte stream.
 //
-//   <prefix> d         → emit Detach
-//   <prefix> <prefix>  → forward a single literal prefix byte
-//   <prefix> <other>   → swallow (matches tmux / screen behaviour)
+// With Prefix::Byte(p):
+//   <p> d   → Detach       <p> D   → Detach+Kill
+//   <p> c   → Detach+New   <p> s   → Detach+Switch
+//   <p> ?   → Help (stay attached, print cheatsheet)
+//   <p> <p> → forward a single literal prefix byte
+//   <p> <x> → swallow (matches tmux / screen behaviour)
+//
+// With Prefix::Meta(c):
+//   ESC c d / D / c / s / ?   → same chord commands
+//   ESC <other>                → forward ESC + <other> verbatim
+//   lone ESC (timeout)         → forward ESC
 //
 // State persists across buffers — the prefix and its command can straddle
 // two reads from stdin without issue.
 struct InputFilter {
-    prefix: u8,
-    in_chord: bool,
+    prefix: Prefix,
+    state: FilterState,
 }
 
 impl InputFilter {
-    fn new(prefix: u8) -> Self {
+    fn new(prefix: Prefix) -> Self {
         Self {
             prefix,
-            in_chord: false,
+            state: FilterState::Normal,
         }
+    }
+
+    fn awaiting_esc(&self) -> bool {
+        matches!(self.state, FilterState::SawEsc)
     }
 
     fn process(&mut self, data: &[u8]) -> FilterOutput {
         let mut out = FilterOutput::default();
         out.forward.reserve(data.len());
         for &b in data {
-            if self.in_chord {
-                self.in_chord = false;
-                if b == CMD_DETACH {
-                    out.detach = true;
-                    return out;
-                } else if b == self.prefix {
-                    out.forward.push(self.prefix);
-                }
-                // anything else is swallowed
-            } else if b == self.prefix {
-                self.in_chord = true;
-            } else {
-                out.forward.push(b);
+            if self.feed(b, &mut out) {
+                return out;
             }
         }
         out
+    }
+
+    // Flush any buffered state (e.g. a lone ESC in SawEsc) back to the
+    // caller so it can be forwarded to the PTY. Called by the input task
+    // when META_FLUSH_MS elapses without a follow-up byte.
+    fn flush(&mut self) -> Vec<u8> {
+        match self.state {
+            FilterState::SawEsc => {
+                self.state = FilterState::Normal;
+                vec![0x1b]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    // Consume one byte. Returns true if the caller should stop feeding
+    // bytes from this buffer (because a terminal chord action — detach or
+    // one of its variants — is ready to fire).
+    fn feed(&mut self, b: u8, out: &mut FilterOutput) -> bool {
+        match self.state {
+            FilterState::Normal => match self.prefix {
+                Prefix::Byte(p) if b == p => {
+                    self.state = FilterState::InChord;
+                }
+                Prefix::Meta(_) if b == 0x1b => {
+                    self.state = FilterState::SawEsc;
+                }
+                _ => out.forward.push(b),
+            },
+            FilterState::SawEsc => {
+                // SawEsc only happens with Meta prefix, but be defensive.
+                match self.prefix {
+                    Prefix::Meta(p) if b == p => {
+                        self.state = FilterState::InChord;
+                    }
+                    _ => {
+                        // Not our chord trigger — flush the buffered ESC
+                        // plus this byte. Arrow keys (`ESC [ A` etc.)
+                        // land here too: we emit the ESC and `[`, then
+                        // subsequent bytes pass through Normal.
+                        out.forward.push(0x1b);
+                        out.forward.push(b);
+                        self.state = FilterState::Normal;
+                    }
+                }
+            }
+            FilterState::InChord => {
+                self.state = FilterState::Normal;
+                match b {
+                    CMD_DETACH => {
+                        out.action = ChordAction::Detach;
+                        return true;
+                    }
+                    CMD_KILL => {
+                        out.action = ChordAction::DetachThenKill;
+                        return true;
+                    }
+                    CMD_NEW => {
+                        out.action = ChordAction::DetachThenNew;
+                        return true;
+                    }
+                    CMD_SWITCH => {
+                        out.action = ChordAction::DetachThenSwitch;
+                        return true;
+                    }
+                    CMD_HELP => {
+                        out.help = true;
+                        // Help is non-terminal: keep consuming the rest
+                        // of the buffer so the user can chain commands
+                        // (e.g. `? d` to peek at help then detach).
+                    }
+                    _ => {
+                        // Literal prefix echo only makes sense for byte
+                        // prefixes — with Meta, the user would have to
+                        // type `ESC <key> ESC <key>`, which is weird.
+                        if let Prefix::Byte(p) = self.prefix
+                            && b == p
+                        {
+                            out.forward.push(p);
+                        }
+                        // anything else is swallowed
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -1379,16 +1836,31 @@ mod tests {
 
     #[test]
     fn parse_prefix_letters() {
-        assert_eq!(parse_prefix("C-a").unwrap(), 0x01);
-        assert_eq!(parse_prefix("C-b").unwrap(), 0x02);
-        assert_eq!(parse_prefix("ctrl-z").unwrap(), 0x1a);
-        assert_eq!(parse_prefix("Ctrl-A").unwrap(), 0x01);
+        assert_eq!(parse_prefix("C-a").unwrap(), Prefix::Byte(0x01));
+        assert_eq!(parse_prefix("C-b").unwrap(), Prefix::Byte(0x02));
+        assert_eq!(parse_prefix("ctrl-z").unwrap(), Prefix::Byte(0x1a));
+        assert_eq!(parse_prefix("Ctrl-A").unwrap(), Prefix::Byte(0x01));
     }
 
     #[test]
     fn parse_prefix_punctuation() {
-        assert_eq!(parse_prefix("C-\\").unwrap(), 0x1c);
-        assert_eq!(parse_prefix("C-]").unwrap(), 0x1d);
+        assert_eq!(parse_prefix("C-\\").unwrap(), Prefix::Byte(0x1c));
+        assert_eq!(parse_prefix("C-]").unwrap(), Prefix::Byte(0x1d));
+    }
+
+    #[test]
+    fn parse_prefix_ctrl_space_aliases() {
+        // All three spellings collapse to 0x00 (NUL / Ctrl-@).
+        assert_eq!(parse_prefix("C-Space").unwrap(), Prefix::Byte(0x00));
+        assert_eq!(parse_prefix("c-space").unwrap(), Prefix::Byte(0x00));
+        assert_eq!(parse_prefix("C-@").unwrap(), Prefix::Byte(0x00));
+    }
+
+    #[test]
+    fn parse_prefix_meta() {
+        assert_eq!(parse_prefix("M-a").unwrap(), Prefix::Meta(b'a'));
+        assert_eq!(parse_prefix("Alt-q").unwrap(), Prefix::Meta(b'q'));
+        assert_eq!(parse_prefix("meta-Z").unwrap(), Prefix::Meta(b'Z'));
     }
 
     #[test]
@@ -1398,59 +1870,162 @@ mod tests {
         assert!(parse_prefix("C-").is_err());
         assert!(parse_prefix("C-ab").is_err());
         assert!(parse_prefix("C-1").is_err());
+        // Meta-[ would collide with CSI introducer — reject.
+        assert!(parse_prefix("M-[").is_err());
+        assert!(parse_prefix("M-").is_err());
     }
+
+    // --- InputFilter: Byte-prefix tests ---
 
     #[test]
     fn filter_passes_normal_input() {
-        let mut f = InputFilter::new(0x01);
+        let mut f = InputFilter::new(Prefix::Byte(0x01));
         let out = f.process(b"hello");
         assert_eq!(out.forward, b"hello");
-        assert!(!out.detach);
+        assert_eq!(out.action, ChordAction::None);
     }
 
     #[test]
     fn filter_detects_chord_detach() {
-        let mut f = InputFilter::new(0x01);
+        let mut f = InputFilter::new(Prefix::Byte(0x01));
         let out = f.process(&[b'a', 0x01, b'd']);
         assert_eq!(out.forward, b"a");
-        assert!(out.detach);
+        assert_eq!(out.action, ChordAction::Detach);
+    }
+
+    #[test]
+    fn filter_chord_new_switch_kill() {
+        for (key, want) in [
+            (b'c', ChordAction::DetachThenNew),
+            (b's', ChordAction::DetachThenSwitch),
+            (b'D', ChordAction::DetachThenKill),
+        ] {
+            let mut f = InputFilter::new(Prefix::Byte(0x01));
+            let out = f.process(&[0x01, key]);
+            assert_eq!(out.action, want, "chord {}", key as char);
+        }
+    }
+
+    #[test]
+    fn filter_help_is_non_terminal() {
+        let mut f = InputFilter::new(Prefix::Byte(0x01));
+        // `<p> ? a b c` → help fires, then `abc` forwards normally.
+        let out = f.process(&[0x01, b'?', b'a', b'b', b'c']);
+        assert!(out.help);
+        assert_eq!(out.action, ChordAction::None);
+        assert_eq!(out.forward, b"abc");
+    }
+
+    #[test]
+    fn filter_help_then_detach_in_same_buffer() {
+        let mut f = InputFilter::new(Prefix::Byte(0x01));
+        let out = f.process(&[0x01, b'?', 0x01, b'd']);
+        assert!(out.help);
+        assert_eq!(out.action, ChordAction::Detach);
     }
 
     #[test]
     fn filter_passes_literal_prefix_on_double() {
-        let mut f = InputFilter::new(0x01);
+        let mut f = InputFilter::new(Prefix::Byte(0x01));
         let out = f.process(&[0x01, 0x01, b'x']);
         assert_eq!(out.forward, &[0x01, b'x']);
-        assert!(!out.detach);
+        assert_eq!(out.action, ChordAction::None);
     }
 
     #[test]
     fn filter_swallows_unknown_chord() {
-        let mut f = InputFilter::new(0x01);
+        let mut f = InputFilter::new(Prefix::Byte(0x01));
         let out = f.process(&[b'a', 0x01, b'z', b'b']);
         assert_eq!(out.forward, b"ab");
-        assert!(!out.detach);
+        assert_eq!(out.action, ChordAction::None);
     }
 
     #[test]
     fn filter_state_spans_buffers() {
-        let mut f = InputFilter::new(0x01);
+        let mut f = InputFilter::new(Prefix::Byte(0x01));
         let out1 = f.process(&[b'x', 0x01]);
         assert_eq!(out1.forward, b"x");
-        assert!(!out1.detach);
+        assert_eq!(out1.action, ChordAction::None);
         let out2 = f.process(b"d");
         assert!(out2.forward.is_empty());
-        assert!(out2.detach);
+        assert_eq!(out2.action, ChordAction::Detach);
     }
 
     #[test]
     fn filter_stops_consuming_after_detach() {
-        let mut f = InputFilter::new(0x01);
+        let mut f = InputFilter::new(Prefix::Byte(0x01));
         // Any bytes after the detach command in the same buffer are
         // dropped — we're disconnecting anyway.
         let out = f.process(&[0x01, b'd', b'z', b'z']);
         assert!(out.forward.is_empty());
-        assert!(out.detach);
+        assert_eq!(out.action, ChordAction::Detach);
+    }
+
+    // --- InputFilter: Meta-prefix tests ---
+
+    #[test]
+    fn meta_filter_passes_normal_input() {
+        let mut f = InputFilter::new(Prefix::Meta(b'a'));
+        let out = f.process(b"hello");
+        assert_eq!(out.forward, b"hello");
+        assert_eq!(out.action, ChordAction::None);
+    }
+
+    #[test]
+    fn meta_filter_detects_chord_detach() {
+        let mut f = InputFilter::new(Prefix::Meta(b'a'));
+        let out = f.process(&[0x1b, b'a', b'd']);
+        assert!(out.forward.is_empty());
+        assert_eq!(out.action, ChordAction::Detach);
+    }
+
+    #[test]
+    fn meta_filter_forwards_non_chord_esc_pair() {
+        let mut f = InputFilter::new(Prefix::Meta(b'a'));
+        // ESC + non-matching byte flushes as-is (e.g. user typed Alt-x).
+        let out = f.process(&[0x1b, b'x', b'y']);
+        assert_eq!(out.forward, &[0x1b, b'x', b'y']);
+        assert_eq!(out.action, ChordAction::None);
+    }
+
+    #[test]
+    fn meta_filter_forwards_arrow_key() {
+        // CSI (ESC [ A) — ESC then `[` is not our prefix, so flush ESC +
+        // `[`, then `A` passes through Normal.
+        let mut f = InputFilter::new(Prefix::Meta(b'a'));
+        let out = f.process(&[0x1b, b'[', b'A']);
+        assert_eq!(out.forward, &[0x1b, b'[', b'A']);
+        assert_eq!(out.action, ChordAction::None);
+    }
+
+    #[test]
+    fn meta_filter_flush_bare_esc() {
+        let mut f = InputFilter::new(Prefix::Meta(b'a'));
+        let out = f.process(&[0x1b]);
+        assert!(out.forward.is_empty());
+        assert!(f.awaiting_esc());
+        let flushed = f.flush();
+        assert_eq!(flushed, vec![0x1b]);
+        assert!(!f.awaiting_esc());
+    }
+
+    #[test]
+    fn meta_filter_swallows_unknown_chord() {
+        // `ESC a x` — `ESC a` enters chord, `x` is an unknown chord
+        // command and gets swallowed. No literal-prefix echo on Meta.
+        let mut f = InputFilter::new(Prefix::Meta(b'a'));
+        let out = f.process(&[0x1b, b'a', b'x']);
+        assert!(out.forward.is_empty());
+        assert_eq!(out.action, ChordAction::None);
+    }
+
+    // --- prefix_display ---
+
+    #[test]
+    fn prefix_display_covers_new_forms() {
+        assert_eq!(prefix_display(Prefix::Byte(0x00)), "Ctrl-Space");
+        assert_eq!(prefix_display(Prefix::Byte(0x01)), "Ctrl-A");
+        assert_eq!(prefix_display(Prefix::Meta(b'a')), "Alt-a");
     }
 
     // --- OutputFilter tests ---
