@@ -270,6 +270,25 @@ Non-interactive playback of a session log file (the
 (including terminal control sequences and colors) to stdout, so piping it
 back through a terminal shows the transcript as it happened.
 
+### `rat grep PATTERN [-s, --session ID_OR_NAME] [--log PATH] [--raw]`
+
+Search session transcripts for a substring. Unique to rat's event-log
+design — you can grep *any* historical session, live or dead, without
+asking the daemon.
+
+```sh
+rat grep ERROR                         # all sessions' logs
+rat grep ERROR -s agent                # just session 'agent'
+rat grep ERROR --log ~/.local/state/rat/<uuid>.log
+rat grep "\x1b\[31m" --raw             # match raw bytes (ANSI codes)
+```
+
+Output format: `{session_short}:{seq}: {line}`. Lines are ANSI-stripped
+by default so colored prompts and editor decorations don't break match
+text; pass `--raw` to match against the literal byte stream.
+
+Search is a plain substring match for now — no regex.
+
 ### `rat init SHELL`
 
 Print shell integration code to stdout. `SHELL` is `zsh`, `bash`, or

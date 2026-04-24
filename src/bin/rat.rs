@@ -131,6 +131,21 @@ enum Cmd {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Search session transcripts for a substring. Works against any .log
+    /// file in the state dir, whether or not the daemon is still running.
+    Grep {
+        /// Substring to search for (case-sensitive).
+        pattern: String,
+        /// Limit search to a specific session (id prefix / name / alias).
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Search a specific log file instead of all logs in the state dir.
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// Match raw bytes instead of ANSI-stripped text.
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 #[tokio::main]
@@ -157,6 +172,12 @@ async fn main() -> Result<()> {
         Some(Cmd::Rename { id, new_name }) => rename(&id, &new_name),
         Some(Cmd::Alias { id, alias }) => add_alias(&id, &alias),
         Some(Cmd::Completions { shell }) => completions(shell),
+        Some(Cmd::Grep {
+            pattern,
+            session,
+            log,
+            raw,
+        }) => grep(&pattern, session.as_deref(), log.as_deref(), raw),
     }
 }
 
@@ -165,6 +186,121 @@ fn completions(shell: clap_complete::Shell) -> Result<()> {
     let name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
     Ok(())
+}
+
+// `rat grep`: scan PtyOutput events across one or more session logs and
+// emit lines that contain the pattern. Output format is
+// `{short}:{seq}: {line}` so it composes with normal unix piping.
+fn grep(
+    pattern: &str,
+    session: Option<&str>,
+    log: Option<&std::path::Path>,
+    raw: bool,
+) -> Result<()> {
+    let logs: Vec<PathBuf> = if let Some(p) = log {
+        vec![p.to_path_buf()]
+    } else if let Some(q) = session {
+        let meta = read_all_metas()?
+            .into_iter()
+            .find(|m| meta_has_label(m, q) || m.id.to_string().starts_with(q))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no session matching '{q}' (need a meta file on disk; use --log for raw log paths)"
+                )
+            })?;
+        vec![meta.log_path]
+    } else {
+        all_log_paths()?
+    };
+
+    if logs.is_empty() {
+        eprintln!("no logs to search");
+        return Ok(());
+    }
+
+    let mut total = 0usize;
+    for path in logs {
+        let log_obj = match FileEventLog::open(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skip {}: {e}", path.display());
+                continue;
+            }
+        };
+        let events = log_obj.read_from(0)?;
+        let short = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.chars().take(8).collect::<String>())
+            .unwrap_or_else(|| "?".into());
+        for ev in events {
+            if let Event::PtyOutput { data } = &ev.event {
+                let text = if raw {
+                    String::from_utf8_lossy(data).into_owned()
+                } else {
+                    strip_ansi(data)
+                };
+                for line in text.lines() {
+                    if line.contains(pattern) {
+                        total += 1;
+                        println!("{short}:{}: {}", ev.seq, line);
+                    }
+                }
+            }
+        }
+    }
+    if total == 0 {
+        eprintln!("no matches for '{pattern}'");
+    }
+    Ok(())
+}
+
+// All .log files under the state dir. Unordered — callers typically just
+// iterate and output in discovery order.
+fn all_log_paths() -> Result<Vec<PathBuf>> {
+    let dir = paths::state_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("log") {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+// Quick-and-dirty ANSI stripper for grep output. Drops CSI sequences
+// (ESC [ params+intermediates final) and the first byte after any bare
+// ESC. OSC sequences (ESC ]) rarely carry grep-relevant text so we
+// don't bother — a CSI-only sweep is enough to make `ls`, prompts,
+// editor output, etc. readable on the matching side.
+fn strip_ansi(data: &[u8]) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0x1b {
+            i += 1;
+            if i < data.len() && data[i] == b'[' {
+                i += 1;
+                while i < data.len() && !(0x40..=0x7e).contains(&data[i]) {
+                    i += 1;
+                }
+                if i < data.len() {
+                    i += 1;
+                }
+            } else if i < data.len() {
+                i += 1;
+            }
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn kill(query: &str, yes: bool) -> Result<()> {
