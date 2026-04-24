@@ -25,6 +25,11 @@ struct Args {
     rows: u16,
     #[arg(long)]
     name: Option<String>,
+    /// Seed the new session's log with PtyOutput events from an existing
+    /// log file before the fresh shell starts. Used by `rat resurrect`
+    /// to reconstruct a dead session's visible scrollback in a new daemon.
+    #[arg(long)]
+    seed_log: Option<PathBuf>,
     /// Command to run; defaults to $SHELL.
     #[arg(trailing_var_arg = true)]
     cmd: Vec<String>,
@@ -102,6 +107,40 @@ async fn main() -> Result<()> {
         cols,
         rows,
     })?;
+
+    // If we were asked to seed, copy the old log's PtyOutput into our fresh
+    // log between SessionStarted and the live shell's first byte. Clients
+    // attaching to this daemon will then see the previous session's
+    // scrollback followed by a visible marker and the new shell.
+    if let Some(seed_path) = &args.seed_log {
+        match FileEventLog::open(seed_path) {
+            Ok(seed_log) => match seed_log.read_from(0) {
+                Ok(events) => {
+                    let mut log_guard = log.lock().unwrap();
+                    let mut copied = 0usize;
+                    for ev in events {
+                        if let Event::PtyOutput { data } = ev.event {
+                            let _ = log_guard.append(Event::PtyOutput { data });
+                            copied += 1;
+                        }
+                    }
+                    // Visible separator. Reset attributes, yellow bar, newline.
+                    let marker =
+                        b"\r\n\x1b[0m\x1b[33m-- rat resurrect: previous session replayed above --\x1b[0m\r\n";
+                    let _ = log_guard.append(Event::PtyOutput {
+                        data: marker.to_vec(),
+                    });
+                    tracing::info!(seed = %seed_path.display(), events = copied, "seeded log from prior session");
+                }
+                Err(e) => {
+                    tracing::warn!(seed = %seed_path.display(), error = %e, "failed to read seed log; continuing without");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(seed = %seed_path.display(), error = %e, "failed to open seed log; continuing without");
+            }
+        }
+    }
 
     let mut child = pty.slave.spawn_command(cmd).context("spawn shell")?;
     let child_pid = child.process_id();
