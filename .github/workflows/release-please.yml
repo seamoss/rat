@@ -69,6 +69,8 @@ jobs:
           bin: rat,rat-daemon
           target: ${{ matrix.target }}
           tar: unix
-          archive: $bin-$tag-$target
+          # `$bin` is forbidden when packaging multiple binaries in one
+          # archive — use `$name` (the Cargo.toml package name) instead.
+          archive: $name-$tag-$target
           ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || needs.release-please.outputs.tag_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
