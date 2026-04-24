@@ -130,6 +130,7 @@ rat new -n agent
 echo "$RAT_NAME / $RAT_SESSION"
 ls
 # Press Ctrl-A then d to detach. The daemon keeps running.
+# Ctrl-A then s hops between sessions; Ctrl-A then ? prints the full cheatsheet.
 
 # List live sessions
 rat list
@@ -233,6 +234,15 @@ Terminate a session. Prompts `Are you sure? [y/N]` (default No) unless
 to SIGKILL if needed. Stale socket / metadata files get swept on the way
 out, so running against a crashed-daemon session cleans up too.
 
+### `rat killall [-y, --yes]`
+
+Nuke every live rat session at once and sweep any stale daemon state.
+Prints a table of what's about to die, prompts `Are you sure? [y/N]`
+(default No), then SIGTERMs every daemon in parallel with a single 2s
+wait before escalating holdouts to SIGKILL. If you're currently inside
+a rat session when you run this, the prompt calls that out — you're
+about to kill the daemon under your own feet.
+
 ### `rat replay LOG_PATH`
 
 Non-interactive playback of a session log file (the
@@ -250,14 +260,23 @@ Print shell integration code to stdout. `SHELL` is `zsh`, `bash`, or
 Rat uses a prefix chord for its own commands, in the tradition of `screen`
 and `tmux`. Default prefix is `Ctrl-A`. Inside an attached session:
 
-| Keys                | Action                                                  |
-| ------------------- | ------------------------------------------------------- |
-| `Ctrl-A` then `d`   | Detach from the session (daemon keeps running)          |
-| `Ctrl-A` `Ctrl-A`   | Send a literal `Ctrl-A` through to the inner program    |
-| `Ctrl-D`            | Normal shell EOF — exits the shell and ends the session |
+| Keys                  | Action                                                       |
+| --------------------- | ------------------------------------------------------------ |
+| `Ctrl-A` then `d`     | Detach from the session (daemon keeps running)               |
+| `Ctrl-A` then `c`     | Detach, spawn a fresh session, and attach to it              |
+| `Ctrl-A` then `s`     | Detach and open the session switcher (picker)                |
+| `Ctrl-A` then `D`     | Detach and kill the session (prompts to confirm)             |
+| `Ctrl-A` then `?`     | Print the chord cheatsheet in-band (session keeps running)   |
+| `Ctrl-A` `Ctrl-A`     | Send a literal `Ctrl-A` through to the inner program         |
+| `Ctrl-D`              | Normal shell EOF — exits the shell and ends the session      |
 
 All other input is forwarded verbatim to the PTY. Any unrecognized chord
 command (e.g., `Ctrl-A x`) is silently swallowed.
+
+`c` and `s` chord commands chain across sessions without leaving `rat`:
+`<prefix> s` detaches the current session, shows the picker, and attaches
+whichever you pick. `<prefix> c` detaches and immediately attaches to a
+fresh session.
 
 ### Why a chord, not a single key?
 
@@ -270,16 +289,35 @@ if the prefix's on-the-wire encoding shifts.
 
 ### Customizing the prefix
 
-Set `RAT_PREFIX` in your environment before `rat new` / `rat attach`. Form
-is `C-<letter>`:
+Set `RAT_PREFIX` in your environment before `rat new` / `rat attach`. Two
+prefix families are supported:
 
 ```sh
-export RAT_PREFIX=C-b     # tmux-style
+export RAT_PREFIX=C-b         # Ctrl-b (tmux-style)
+export RAT_PREFIX=C-Space     # Ctrl-Space / Ctrl-@ — kinder on the pinky
+export RAT_PREFIX=M-a         # Alt-a / Meta-a — no Ctrl stretch at all
 rat new -n agent
 ```
 
-Supported values: `C-a` through `C-z`, plus `C-\`, `C-]`, `C-^`, `C-_`. An
-invalid value causes `rat attach` to fail fast before entering raw mode.
+Supported values:
+
+- **Ctrl form:** `C-a` through `C-z`, `C-Space` (alias: `C-@`), plus `C-\`,
+  `C-]`, `C-^`, `C-_`.
+- **Meta form:** `M-<letter>` or `M-<digit>` (also spelled `Alt-…` or
+  `Meta-…`).
+
+An invalid value causes `rat attach` to fail fast before entering raw mode.
+
+**Meta-prefix caveat:** your terminal must send Alt-`a` as `ESC a`. iTerm2
+(*Profiles → Keys → General → Left/Right Option key → Esc+*), GNOME
+Terminal, Alacritty, and kitty do this by default or via a single setting.
+macOS's stock Terminal.app requires *Profile → Keyboard → Use Option as
+Meta key*. If Alt presses look like accented characters instead, the
+chord won't fire.
+
+A Meta prefix adds a ~50ms flush timeout on bare `ESC` presses so vim and
+readline still get `ESC` delivered promptly. Ctrl-prefixes have zero
+latency.
 
 ## Nested sessions
 
