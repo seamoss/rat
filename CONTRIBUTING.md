@@ -155,17 +155,74 @@ We follow the Rust community defaults. A few project-specific notes:
 
 ## Commits and pull requests
 
-**Commits:**
+**Conventional Commits are required.** Releases are automated via
+[release-please](https://github.com/googleapis/release-please); the
+commit-message *type* determines whether (and how) the next version
+bumps, and the subject line is what lands in `CHANGELOG.md`. A commit
+that doesn't follow the format won't be rejected, but it also won't
+show up in the release notes, so please use one of the types below.
 
-- Imperative subject, 50 chars or less: `Add SIGHUP handling to daemon`.
-- Body wraps at 72 chars. Explain *why* the change is needed and any
-  non-obvious design choices.
-- One logical change per commit where practical. Refactors and behavior
-  changes in the same commit are painful to review.
+**Format:**
+
+```
+<type>(<optional scope>): <imperative subject, 50 chars or less>
+
+<optional body wrapping at 72 chars — explain the *why*>
+
+<optional footers: BREAKING CHANGE: …, Closes #NN, Co-authored-by: …>
+```
+
+**Types we use:**
+
+| Type       | Version bump        | Appears in CHANGELOG |
+| ---------- | ------------------- | -------------------- |
+| `feat`     | Minor (0.x.0)       | Yes — "Features"     |
+| `fix`      | Patch (0.0.x)       | Yes — "Bug Fixes"    |
+| `perf`     | Patch               | Yes — "Performance"  |
+| `revert`   | Patch               | Yes — "Reverts"      |
+| `docs`     | None                | Yes — "Documentation"|
+| `refactor` | None                | No                   |
+| `test`     | None                | No                   |
+| `ci`       | None                | No                   |
+| `chore`    | None                | No                   |
+
+**Breaking changes** bump major (or minor while we're pre-1.0). Mark
+them with either `!` after the type (`feat!: drop RAT_PREFIX fallback`)
+or a `BREAKING CHANGE:` footer. Spell out the migration path in the
+body — breaking changes are expensive for users, so the more guidance
+the better.
+
+**Examples:**
+
+```
+feat(daemon): support SIGHUP to cycle the log file
+
+fix(attach): don't deadlock when PTY closes mid-resize
+
+ci: cache cargo registry between runs
+
+docs: add iTerm2 Meta-key configuration walkthrough
+
+feat!: rename rat-daemon to ratd
+
+BREAKING CHANGE: users who installed rat-daemon directly (symlinks,
+systemd units, etc.) need to switch to the new name. Automatic upgrade
+path is in the README.
+```
+
+**Scopes** are optional but helpful when the change is localized —
+`keys`, `daemon`, `cli`, `protocol`, `docs`, `ci` are good picks.
+
+**One logical change per commit where practical.** Refactors and
+behavior changes in the same commit are painful to review.
+
+**Do not manually edit `Cargo.toml` version, `Cargo.lock`, or
+`CHANGELOG.md`.** release-please owns all three — it updates them in
+the release PR it maintains on `dev`.
 
 **Pull requests:**
 
-- Rebase onto `main` before opening; avoid merge commits.
+- Rebase onto `dev` before opening; avoid merge commits.
 - Include a short description of what changes and why.
 - Link related issues with `Closes #NN` / `Fixes #NN`.
 - If your PR touches user-facing behavior, update the README accordingly.
@@ -174,8 +231,29 @@ We follow the Rust community defaults. A few project-specific notes:
   implications in the PR description.
 - Keep PRs focused. Split scope creep into follow-ups.
 
-**CI (coming):** Once we wire up CI, PRs will need green `cargo fmt`,
-`cargo clippy`, and `cargo test`. Until then, please run them locally.
+**CI:** `cargo fmt`, `cargo clippy -D warnings`, and `cargo test` must
+be green. CI runs on every PR against `dev`; you can run the same
+checks locally (see [Build, run, test](#build-run-test)).
+
+## Release process
+
+Releases are automated. You shouldn't need to run anything by hand for
+a normal release — but here's what happens so the pipeline isn't a
+mystery:
+
+1. Conventional commits land on `dev`.
+2. The `release-please` workflow maintains an open PR against `dev`
+   titled `chore: release <version>`. The PR bumps `Cargo.toml` +
+   `Cargo.lock` and regenerates `CHANGELOG.md` from the commits since
+   the last tag.
+3. When a maintainer merges the release PR, release-please creates a
+   `vX.Y.Z` tag and a GitHub Release with the changelog as its body.
+4. The `build-release` workflow picks up the `release: published`
+   event and uploads cross-compiled tarballs of `rat` + `rat-daemon`
+   for x86_64 + aarch64 on Linux and macOS.
+
+If something needs hand-fixing mid-flight, edit the release PR the same
+way you'd edit any other PR and re-request review.
 
 ## Bug reports
 
