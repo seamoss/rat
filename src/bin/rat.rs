@@ -957,10 +957,8 @@ fn run_picker(items: &[SessionMeta]) -> Result<Option<SessionId>> {
                     KeyCode::Up | KeyCode::Char('k') => {
                         cursor = cursor.saturating_sub(1);
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if cursor + 1 < items.len() {
-                            cursor += 1;
-                        }
+                    KeyCode::Down | KeyCode::Char('j') if cursor + 1 < items.len() => {
+                        cursor += 1;
                     }
                     KeyCode::Home => cursor = 0,
                     KeyCode::End => cursor = items.len().saturating_sub(1),
