@@ -247,6 +247,25 @@ rat attach pp      # resolves to processing-pipeline
 Aliases share the same namespace as names; they must be unique among live
 sessions. They disappear when the session ends.
 
+### `rat watch ID_OR_NAME`
+
+Read-only passive observer. Connects to a session, replays its log,
+and then tails live output to stdout. **Nothing is sent back** — no
+input forwarded, no resize sent, the interactive attacher's session
+is untouched. `Ctrl-C` stops watching.
+
+```sh
+rat watch agent                 # follow session 'agent'
+rat watch agent | tee agent.out # also capture to a file
+rat watch agent > /dev/null &   # background watch for CI/monitor use
+```
+
+Useful for over-the-shoulder review without risking an errant keypress
+into the live session, or for piping a session's live output into
+another tool. The watcher doesn't enter raw mode, so output is
+subject to your terminal's current width; for clean rendering match
+the attached client's size.
+
 ### `rat kill ID_OR_NAME [-y, --yes]`
 
 Terminate a session. Prompts `Are you sure? [y/N]` (default No) unless
