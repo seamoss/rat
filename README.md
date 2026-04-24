@@ -247,6 +247,25 @@ rat attach pp      # resolves to processing-pipeline
 Aliases share the same namespace as names; they must be unique among live
 sessions. They disappear when the session ends.
 
+### `rat watch ID_OR_NAME`
+
+Read-only passive observer. Connects to a session, replays its log,
+and then tails live output to stdout. **Nothing is sent back** — no
+input forwarded, no resize sent, the interactive attacher's session
+is untouched. `Ctrl-C` stops watching.
+
+```sh
+rat watch agent                 # follow session 'agent'
+rat watch agent | tee agent.out # also capture to a file
+rat watch agent > /dev/null &   # background watch for CI/monitor use
+```
+
+Useful for over-the-shoulder review without risking an errant keypress
+into the live session, or for piping a session's live output into
+another tool. The watcher doesn't enter raw mode, so output is
+subject to your terminal's current width; for clean rendering match
+the attached client's size.
+
 ### `rat kill ID_OR_NAME [-y, --yes]`
 
 Terminate a session. Prompts `Are you sure? [y/N]` (default No) unless
@@ -262,6 +281,35 @@ Prints a table of what's about to die, prompts `Are you sure? [y/N]`
 wait before escalating holdouts to SIGKILL. If you're currently inside
 a rat session when you run this, the prompt calls that out — you're
 about to kill the daemon under your own feet.
+
+### `rat resurrect SOURCE [-n, --name NAME] [-f, --force]`
+
+Spin up a fresh daemon whose event log is pre-seeded with an old
+session's `PtyOutput`, then attach. The original PTY is long gone, so
+the new shell is fresh — but the scrollback you left behind is
+replayed into place, followed by a yellow `-- rat resurrect:
+previous session replayed above --` separator and the live prompt.
+
+`SOURCE` is either:
+- a `.log` file path (absolute or relative), or
+- a session name / alias / UUID / UUID prefix that still has a
+  meta file on disk (dead sessions qualify — metas are only removed
+  by clean shutdown or `rat kill`).
+
+```sh
+# By path — works even if the meta is gone
+rat resurrect ~/.local/state/rat/<uuid>.log
+
+# By name — resolves via the still-present meta
+rat resurrect agent
+
+# Name the resurrected session differently
+rat resurrect agent -n agent-ii
+```
+
+What you get back: visual history. What you don't: the old process,
+the old environment, the old working directory. Resurrect rebuilds
+"what I was looking at," not "what I was running."
 
 ### `rat replay LOG_PATH`
 
@@ -333,6 +381,7 @@ and `tmux`. Default prefix is `Ctrl-A`. Inside an attached session:
 | `Ctrl-A` then `c`     | Detach, spawn a fresh session, and attach to it              |
 | `Ctrl-A` then `s`     | Detach and open the session switcher (picker)                |
 | `Ctrl-A` then `D`     | Detach and kill the session (prompts to confirm)             |
+| `Ctrl-A` then `[`     | Enter copy mode: scroll the client-side scrollback buffer    |
 | `Ctrl-A` then `?`     | Print the chord cheatsheet in-band (session keeps running)   |
 | `Ctrl-A` `Ctrl-A`     | Send a literal `Ctrl-A` through to the inner program         |
 | `Ctrl-D`              | Normal shell EOF — exits the shell and ends the session      |
@@ -344,6 +393,30 @@ command (e.g., `Ctrl-A x`) is silently swallowed.
 `<prefix> s` detaches the current session, shows the picker, and attaches
 whichever you pick. `<prefix> c` detaches and immediately attaches to a
 fresh session.
+
+### Copy mode
+
+`<prefix> [` enters a read-only scrollback viewer on the alternate screen.
+While it's up, live output from the shell keeps arriving in the
+background and gets flushed to the main screen as soon as you exit.
+
+Keys inside copy mode:
+
+| Key                     | Action                                             |
+| ----------------------- | -------------------------------------------------- |
+| `j` / `↓`               | Scroll one line down (toward newer output)         |
+| `k` / `↑`               | Scroll one line up (toward older output)           |
+| `Space` / `PgDn` / `^F` | Page down                                          |
+| `b`    / `PgUp` / `^B`  | Page up                                            |
+| `g`                     | Jump to oldest line in the buffer                  |
+| `G`                     | Jump to newest line (bottom)                       |
+| `q` / `Esc`             | Exit copy mode; main screen catches up to live     |
+
+The buffer is client-side and capped at 1 MiB by default. Override
+with `RAT_SCROLLBACK_BYTES=<n>` before `rat attach`. ANSI escape
+sequences are stripped for rendering stability — copy mode trades
+colour fidelity for predictable line navigation. If you want a
+coloured-transcript search instead, use `rat grep` against the log.
 
 ### Why a chord, not a single key?
 
