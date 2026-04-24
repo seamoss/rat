@@ -255,6 +255,34 @@ back through a terminal shows the transcript as it happened.
 Print shell integration code to stdout. `SHELL` is `zsh`, `bash`, or
 `fish`. Intended for an `eval` in your rc file.
 
+### `rat completions SHELL`
+
+Print a shell completion script to stdout. Supports `bash`, `zsh`,
+`fish`, `elvish`, and `powershell`. Tab-completes subcommands,
+option flags, and anywhere a shell value is expected.
+
+One-shot (this shell session only):
+
+```sh
+eval "$(rat completions zsh)"
+```
+
+Persistent — drop it in your shell's completion directory. Examples:
+
+```sh
+# zsh (pick a dir already on $fpath; ~/.zfunc is a common choice)
+mkdir -p ~/.zfunc
+rat completions zsh > ~/.zfunc/_rat
+# ensure fpath + autoload in ~/.zshrc if you haven't already:
+#   fpath=(~/.zfunc $fpath); autoload -U compinit && compinit
+
+# bash
+rat completions bash > ~/.local/share/bash-completion/completions/rat
+
+# fish
+rat completions fish > ~/.config/fish/completions/rat.fish
+```
+
 ## Keybindings
 
 Rat uses a prefix chord for its own commands, in the tradition of `screen`
