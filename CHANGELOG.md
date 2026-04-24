@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.0](https://github.com/seamoss/rat/compare/rat-v0.3.0...rat-v0.4.0) (2026-04-24)
+
+
+### Features
+
+* add install.sh for one-line prebuilt-binary install ([2e340b2](https://github.com/seamoss/rat/commit/2e340b2bf8c1144e25536c12699818830d20e28c))
+* **cli:** add rat completions for shell tab-completion ([2d2ed00](https://github.com/seamoss/rat/commit/2d2ed00d12596a3bc0367445f0f8e202058ffb95))
+* **cli:** add rat grep for transcript search ([a8c598f](https://github.com/seamoss/rat/commit/a8c598fb059312c6b2f4c57fc9668cb374e00c71))
+* **cli:** rat completions for shell tab-complete ([dadb94d](https://github.com/seamoss/rat/commit/dadb94d141ec20cf368a63a4eb427faff887dda3))
+* **cli:** rat grep for transcript search ([fcdc868](https://github.com/seamoss/rat/commit/fcdc86829ee763acea77fda3b7db8825e958ff59))
+* install.sh one-liner for prebuilt binaries ([153e2d9](https://github.com/seamoss/rat/commit/153e2d9f6e6470e2d1d8aed758fc41dec2bc6be7))
+
+
+### Bug Fixes
+
+* **ci:** chain binary builds inside release-please workflow ([c7166bf](https://github.com/seamoss/rat/commit/c7166bf8e83400c86fbf26e63db7c37044d0f1be))
+* **ci:** chain binary builds inside release-please workflow ([1ca1bd9](https://github.com/seamoss/rat/commit/1ca1bd91aba458b1f02ba2c6a837e269f8ecb5b3))
+
 ## [0.3.0](https://github.com/seamoss/rat/compare/rat-v0.2.1...rat-v0.3.0) (2026-04-24)
 
 
