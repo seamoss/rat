@@ -1,6 +1,6 @@
 [package]
 name = "rat"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "A terminal session multiplexer built for cloud workflows — session state lives in an append-only event log, not in the daemon process."
 license = "MIT"
