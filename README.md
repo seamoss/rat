@@ -18,7 +18,7 @@ Kill the daemon and your session survives. Grep your entire history across every
 ╭────────────────────────────────────────────────────────────╮
 │                                                            │
 │   █▀█ ▄▀█ ▀█▀                                              │
-│   █▀▄ █▀█ ░█░   rat v0.4.1 · cloud-terminal multiplexer    │
+│   █▀▄ █▀█ ░█░   rat v0.4.2 · cloud-terminal multiplexer    │
 │                                                            │
 ╰────────────────────────────────────────────────────────────╯
 ```

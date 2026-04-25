@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.2](https://github.com/seamoss/rat/compare/rat-v0.4.1...rat-v0.4.2) (2026-04-25)
+
+
+### Documentation
+
+* rewrite README to lead with event-log thesis + auto-sync version banner ([550e190](https://github.com/seamoss/rat/commit/550e1909da9a17ca08ab49817327301d132e9a02))
+* rewrite README to lead with the event-log thesis ([23a7cc1](https://github.com/seamoss/rat/commit/23a7cc158b15aa3368468571639902249f16fdd5))
+
 ## [0.4.1](https://github.com/seamoss/rat/compare/rat-v0.4.0...rat-v0.4.1) (2026-04-24)
 
 
