@@ -1,605 +1,280 @@
 # Rat
 
-**A terminal session multiplexer built for cloud workflows.** Rat decouples
-session state from the host process so your shell sessions survive daemon
-restarts, terminal closures, and flaky network connections — and can be
-replayed later as an event stream.
+**A terminal session multiplexer that puts session state on disk, not in the daemon.**
+Kill the daemon and your session survives. Grep your entire history across every session you've ever run. Resurrect a dead session's scrollback into a fresh shell. Watch a live session without touching it. Then detach, reattach, hand it off.
 
+[![release][release-badge]][releases]
+[![license][license-badge]][license]
+[![platforms][platforms-badge]][releases]
+
+[release-badge]: https://img.shields.io/github/v/release/seamoss/rat?filter=rat-*&label=release&color=orange
+[license-badge]: https://img.shields.io/github/license/seamoss/rat?color=orange
+[platforms-badge]: https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-orange
+[releases]: https://github.com/seamoss/rat/releases
+[license]: LICENSE
+
+<!-- x-release-please-start-version -->
 ```
 ╭────────────────────────────────────────────────────────────╮
 │                                                            │
 │   █▀█ ▄▀█ ▀█▀                                              │
-│   █▀▄ █▀█ ░█░   rat v0.2.1 · cloud-terminal multiplexer    │
+│   █▀▄ █▀█ ░█░   rat v0.4.1 · cloud-terminal multiplexer    │
 │                                                            │
 ╰────────────────────────────────────────────────────────────╯
 ```
-
-## Why another multiplexer?
-
-Tmux's model is brilliant on the machine where you live. It gets rough once
-your work leaves that machine:
-
-- **Session state lives in the daemon process.** If the daemon dies, the
-  session dies with it — scrollback, environment, everything.
-- **Reattaching over flaky networks is fragile.** Mosh fixes the wire, not
-  the state model.
-- **You can't hand a session off.** No portable artifact to replay, inspect,
-  or migrate.
-
-Rat's wedge: **session state lives in an append-only event log on disk, not
-in the daemon's memory.** Every keystroke, every byte of shell output, every
-resize — all events, all serialized, all replayable. The daemon is a
-well-behaved consumer of that log, not its owner. Kill the daemon and the
-session transcript is still there; start a new daemon and it can pick up
-where the last one left off.
-
-This README covers what's built today. The longer-term vision is in
-[ARCHITECTURE.md](ARCHITECTURE.md).
-
-## Status
-
-Rat is at a working MVP. The core thesis is proven end-to-end:
-
-- A detached background daemon holds a PTY, writes an event log, and serves
-  clients over a Unix socket.
-- Multiple clients can attach to the same session, see the scrollback replay,
-  and interact live.
-- Sessions survive client disconnect, terminal closure, and `rat kill`.
-- Everything that happens is recorded and can be replayed offline from the
-  log file.
-
-What it isn't yet: distributed across hosts, remote-attachable over SSH, or
-a full TUI with panes. See [Roadmap](#roadmap).
-
-## Features
-
-- **Detached daemon** — sessions outlive the terminal that started them.
-- **Reattach from anywhere** — open a new terminal, `rat attach <name>`,
-  scrollback replays, you're back.
-- **Multi-client attach** — several terminals can observe and drive the same
-  session (pair programming, over-the-shoulder review).
-- **Event log per session** — full transcript on disk; use `rat replay` to
-  play it back offline.
-- **Session naming** — `rat new -n agent`, `rat attach agent`. `$RAT_NAME`
-  and `$RAT_SESSION` are exported to the child so your shell prompt can
-  reflect the session context.
-- **Interactive picker** — `rat list` in a TTY shows an arrow-key picker
-  into attach; piped output stays plain text for scripts.
-- **Graceful teardown** — `rat kill` sends SIGTERM, escalates to SIGKILL on
-  timeout, cleans up stale socket/metadata files either way.
-- **Shell integration** — `eval "$(rat init zsh|bash|fish)"` decorates your
-  prompt inside rat sessions.
-- **SIGWINCH propagation** — resize your terminal, the PTY follows.
+<!-- x-release-please-end -->
 
 ## Install
 
-### One-liner (prebuilt binaries)
+One line, prebuilt binaries, no Rust toolchain required:
 
 ```sh
 curl -sSfL https://raw.githubusercontent.com/seamoss/rat/dev/install.sh | sh
 ```
 
-Detects your OS + arch, pulls the latest release tarball from GitHub,
-and drops `rat` + `rat-daemon` into `~/.local/bin`. Supported targets:
-`x86_64` / `aarch64` on Linux (glibc) and macOS.
+Detects your OS + arch, pulls the latest release tarball, drops `rat` + `rat-daemon` into `~/.local/bin`. Overrides: `RAT_VERSION=rat-v0.4.1`, `RAT_PREFIX_INSTALL=/usr/local/bin`, `RAT_REPO=your/fork`.
 
-Overrides:
+From source:
 
 ```sh
-# Install a specific version
-RAT_VERSION=rat-v0.3.0 curl -sSfL https://raw.githubusercontent.com/seamoss/rat/dev/install.sh | sh
-
-# Install somewhere else
-RAT_PREFIX_INSTALL=/usr/local/bin curl -sSfL https://raw.githubusercontent.com/seamoss/rat/dev/install.sh | sudo sh
-```
-
-### From source
-
-**Requirements:** Rust 1.80+ (`edition = "2024"` in `Cargo.toml`),
-a Unix-like OS (Linux or macOS). Windows is not currently supported.
-
-```sh
-git clone https://github.com/seamoss/rat.git
-cd rat
+git clone https://github.com/seamoss/rat.git && cd rat
 cargo build --release
+ln -sf "$PWD/target/release/rat"        ~/.local/bin/rat
+ln -sf "$PWD/target/release/rat-daemon" ~/.local/bin/rat-daemon
 ```
 
-This produces two binaries in `target/release/`:
-
-- `rat` — the interactive CLI (client + launcher).
-- `rat-daemon` — the background session host, invoked by `rat new`.
-
-Install by copying or symlinking both into a directory on your `PATH` — they
-must sit side-by-side (the launcher finds `rat-daemon` next to its own
-executable):
+Shell integration — one `eval` in your rc file, your prompt gains an orange `[rat]` tag whenever you're inside a session:
 
 ```sh
-mkdir -p ~/.local/bin
-ln -s "$PWD/target/release/rat"        ~/.local/bin/rat
-ln -s "$PWD/target/release/rat-daemon" ~/.local/bin/rat-daemon
+eval "$(rat init zsh)"        # ~/.zshrc
+eval "$(rat init bash)"       # ~/.bashrc
+rat init fish | source        # ~/.config/fish/config.fish
 ```
 
-Then either ensure `~/.local/bin` is on your `PATH` or place the symlinks in
-a directory that already is (`/usr/local/bin`, etc.).
-
-### Shell integration
-
-Add a prompt decoration so sessions you're attached to are visibly marked:
+Tab-completion — pick your shell, drop the output in the completion dir:
 
 ```sh
-# ~/.zshrc
-eval "$(rat init zsh)"
-
-# ~/.bashrc
-eval "$(rat init bash)"
-
-# ~/.config/fish/config.fish
-rat init fish | source
+rat completions zsh > ~/.zfunc/_rat
+rat completions bash > ~/.local/share/bash-completion/completions/rat
+rat completions fish > ~/.config/fish/completions/rat.fish
 ```
 
-Inside a rat session, your prompt gains an orange `[rat]` (or `[rat:NAME]`
-if named) prefix. Outside rat, your prompt is untouched.
+**Platforms:** native on macOS and Linux, both `x86_64` and `aarch64`. Windows is roadmap — `portable-pty` works there already, we just need named pipes in place of Unix sockets and a different detach strategy. Until then, any modern terminal emulator works: iTerm2, Alacritty, kitty, wezterm, GNOME Terminal, Terminal.app — rat specifically handles kitty's CSI-u keyboard protocol and xterm's `modifyOtherKeys` so chords keep working inside TUIs like Claude Code, helix, and vim.
+
+## Why rat
+
+Tmux and screen are great tools. They solve the problem rat leaves alone (panes, windows, status bars, rich in-session UI) and miss the problem rat solves (your sessions are *valuable* and should behave like data, not like daemon-bound processes).
+
+Rat's wedge:
+
+> **Session state lives in an append-only event log on disk, not in the daemon's memory.**
+
+Every keystroke, every byte of shell output, every resize — all events, all serialized, all replayable. The daemon is a well-behaved consumer of the log, not its owner. Kill the daemon and the session transcript is still there. Start a new daemon and it can pick up where the last one left off.
+
+That single architectural choice cascades into features tmux and screen can't offer without a rewrite:
+
+- **`rat grep`** searches the full transcript of any session — live, detached, or long-dead — the way you'd grep a file. Tmux's scrollback is in RAM; you can't grep last Tuesday's session.
+- **`rat resurrect`** replays a dead session's scrollback into a fresh daemon so you can pick up where a crash, reboot, or `kill -9` left you. Tmux has no concept of "previous session."
+- **`rat replay`** is bit-exact offline playback of a log file, control sequences and all — pipe it to a terminal and watch the session happen again.
+- **`rat watch`** attaches read-only so you can monitor a session without the raw-mode contract or any risk of sending stray input. Pair programming, over-the-shoulder review, CI-style live capture — all cleanly separated from interactive attach.
+
+The event log also sets up everything on the roadmap: durable state across hosts, session migration, compaction/snapshots, log-backed scrollback search. None of this needs a protocol change — it's all just different consumers of the same log format.
+
+### Comparison
+
+| Capability                            |  rat  |  tmux  | screen | zellij |
+| ------------------------------------- | :---: | :----: | :----: | :----: |
+| Detached sessions                     |   ✅  |   ✅   |   ✅   |   ✅   |
+| Multi-client attach                   |   ✅  |   ✅   |   ❌   |   ✅   |
+| Session survives daemon crash         |   ✅  |   ❌   |   ❌   |   ❌   |
+| Grep historical sessions              |   ✅  |   ❌   |   ❌   |   ❌   |
+| Resurrect a dead session's scrollback |   ✅  |   ❌   |   ❌   |   ❌   |
+| Offline replay of a session log       |   ✅  |   ❌   |   ❌   |  part  |
+| Read-only observer (no keystrokes)    |   ✅  |   ❌   |   ❌   |   ❌   |
+| Session naming + aliases              |   ✅  |   ✅   |   ✅   |   ✅   |
+| Interactive session picker            |   ✅  |  tab  |   ❌   |   ✅   |
+| One-line prebuilt-binary install      |   ✅  | via pkg | via pkg | via pkg |
+| Panes / windows / layouts             |   ❌  |   ✅   |   ✅   |   ✅   |
+| Copy-mode text selection              |   ❌  |   ✅   |   ✅   |   ✅   |
+| Status bar                            |   ❌  |   ✅   |   ✅   |   ✅   |
+| Scripting language                    |   ❌  |   ✅   |   ✅   |  part  |
+| Windows support                       |  soon  |   ❌   |   ❌   |   ❌   |
+| macOS / Linux (x86_64 + aarch64)      |   ✅  |   ✅   |   ✅   |   ✅   |
+
+If you live inside a single terminal window and need tiling, tmux is still the right tool. If your sessions outlive any particular machine or terminal window and you want them to behave like searchable, replayable, resurrectable artifacts — that's rat.
 
 ## Quick start
 
 ```sh
-# Start a new named session
-rat new -n agent
-
-# ... you're in a shell. Inside:
+rat new -n agent                    # new named session, you're attached
 echo "$RAT_NAME / $RAT_SESSION"
-ls
-# Press Ctrl-A then d to detach. The daemon keeps running.
-# Ctrl-A then s hops between sessions; Ctrl-A then ? prints the full cheatsheet.
+# press Ctrl-A then d to detach
 
-# List live sessions
-rat list
-# (in a terminal, this pops into an arrow-key picker;
-#  Enter on a row attaches to it)
+rat list                            # arrow-key picker in a TTY, plain table when piped
+rat attach agent                    # by name …
+rat attach a4b2                     # … or UUID prefix
 
-# Reattach by name
-rat attach agent
+rat watch agent                     # read-only tail from another terminal
+rat grep ERROR -s agent             # search one session's full history
+rat grep ERROR                      # search every session, ever
+rat resurrect agent                 # dead session? replay its scrollback into a fresh shell
+rat killall                         # SIGTERM every daemon with confirm + stale sweep
 
-# Reattach by UUID prefix
-rat attach a4b2
-
-# Kill a session (with confirmation)
-rat kill agent
-# Kill this session?
-#   id: ...
-# Are you sure? [y/N]
-
-# Offline replay of a session log
-rat replay ~/.local/state/rat/<uuid>.log
+rat replay ~/.local/state/rat/<uuid>.log   # offline playback, control codes intact
 ```
 
-## Commands
-
-### `rat` (no subcommand)
-
-Spawn a detached session with a fresh UUID, print the UUID to stdout, and
-exit without attaching. Useful for scripts and for "give me a session I
-can pick up later":
-
-```sh
-$ id=$(rat)
-$ echo "$id"
-f898f408-98a6-4c89-811f-aa3ea6f7eecf
-$ rat attach "$id"
-```
-
-Respects the nested-session warning. For named or custom-command creates,
-use `rat new`.
-
-### `rat new [-n, --name NAME] [-f, --force] [-- CMD [ARGS...]]`
-
-Create a new session and attach to it. The daemon forks itself into a new
-session (`setsid`), so closing your terminal won't take it down.
-
-- `--name NAME` (short `-n`): human-friendly label. Names must be unique
-  among live sessions. Exported as `$RAT_NAME` to the child.
-- `--force` (short `-f`): skip the nested-session warning (see
-  [Nested sessions](#nested-sessions)).
-- Anything after `--` becomes the command to run. Defaults to `$SHELL`.
-
-### `rat attach ID_OR_NAME [-f, --force]`
-
-Attach to an existing session. `ID_OR_NAME` can be:
-
-- A full UUID
-- A unique UUID prefix (e.g., `a4b2`)
-- A session name (e.g., `agent`)
-
-Exact name match wins over prefix match if both would apply. `--force`
-(short `-f`) skips the nested-session warning.
-
-### `rat list [-f, --force]`
-
-Show running sessions. In a TTY, pops up an arrow-key picker: ↑/↓ (or
-`j`/`k`) to navigate, Enter attaches, `Esc`/`q`/`Ctrl-C` cancels. When the
-output is piped, prints a plain text table so scripts continue to work.
-`--force` applies to the attach that follows a picker selection.
-
-### `rat rename ID_OR_NAME NEW_NAME`
-
-Change a live session's primary name. The new name must be unique among
-live sessions (including aliases).
-
-```sh
-rat rename agent staging
-```
-
-**Caveat:** `$RAT_NAME` inside the already-running shell was exported at
-PTY spawn time and cannot be mutated from outside. Prompts decorated via
-`rat init` will keep showing the old name until the shell restarts.
-
-### `rat alias ID_OR_NAME ALIAS`
-
-Add a secondary label that also resolves to the session. Useful when you
-want a long descriptive name and a short handle:
-
-```sh
-rat new -n processing-pipeline
-rat alias processing-pipeline pp
-rat attach pp      # resolves to processing-pipeline
-```
-
-Aliases share the same namespace as names; they must be unique among live
-sessions. They disappear when the session ends.
-
-### `rat watch ID_OR_NAME`
-
-Read-only passive observer. Connects to a session, replays its log,
-and then tails live output to stdout. **Nothing is sent back** — no
-input forwarded, no resize sent, the interactive attacher's session
-is untouched. `Ctrl-C` stops watching.
-
-```sh
-rat watch agent                 # follow session 'agent'
-rat watch agent | tee agent.out # also capture to a file
-rat watch agent > /dev/null &   # background watch for CI/monitor use
-```
-
-Useful for over-the-shoulder review without risking an errant keypress
-into the live session, or for piping a session's live output into
-another tool. The watcher doesn't enter raw mode, so output is
-subject to your terminal's current width; for clean rendering match
-the attached client's size.
-
-### `rat kill ID_OR_NAME [-y, --yes]`
-
-Terminate a session. Prompts `Are you sure? [y/N]` (default No) unless
-`--yes` is passed. Sends SIGTERM to the daemon, waits up to 2s, escalates
-to SIGKILL if needed. Stale socket / metadata files get swept on the way
-out, so running against a crashed-daemon session cleans up too.
-
-### `rat killall [-y, --yes]`
-
-Nuke every live rat session at once and sweep any stale daemon state.
-Prints a table of what's about to die, prompts `Are you sure? [y/N]`
-(default No), then SIGTERMs every daemon in parallel with a single 2s
-wait before escalating holdouts to SIGKILL. If you're currently inside
-a rat session when you run this, the prompt calls that out — you're
-about to kill the daemon under your own feet.
-
-### `rat resurrect SOURCE [-n, --name NAME] [-f, --force]`
-
-Spin up a fresh daemon whose event log is pre-seeded with an old
-session's `PtyOutput`, then attach. The original PTY is long gone, so
-the new shell is fresh — but the scrollback you left behind is
-replayed into place, followed by a yellow `-- rat resurrect:
-previous session replayed above --` separator and the live prompt.
-
-`SOURCE` is either:
-- a `.log` file path (absolute or relative), or
-- a session name / alias / UUID / UUID prefix that still has a
-  meta file on disk (dead sessions qualify — metas are only removed
-  by clean shutdown or `rat kill`).
-
-```sh
-# By path — works even if the meta is gone
-rat resurrect ~/.local/state/rat/<uuid>.log
-
-# By name — resolves via the still-present meta
-rat resurrect agent
-
-# Name the resurrected session differently
-rat resurrect agent -n agent-ii
-```
-
-What you get back: visual history. What you don't: the old process,
-the old environment, the old working directory. Resurrect rebuilds
-"what I was looking at," not "what I was running."
-
-### `rat replay LOG_PATH`
-
-Non-interactive playback of a session log file (the
-`~/.local/state/rat/<uuid>.log` files). Writes the raw PTY output stream
-(including terminal control sequences and colors) to stdout, so piping it
-back through a terminal shows the transcript as it happened.
-
-### `rat grep PATTERN [-s, --session ID_OR_NAME] [--log PATH] [--raw]`
-
-Search session transcripts for a substring. Unique to rat's event-log
-design — you can grep *any* historical session, live or dead, without
-asking the daemon.
-
-```sh
-rat grep ERROR                         # all sessions' logs
-rat grep ERROR -s agent                # just session 'agent'
-rat grep ERROR --log ~/.local/state/rat/<uuid>.log
-rat grep "\x1b\[31m" --raw             # match raw bytes (ANSI codes)
-```
-
-Output format: `{session_short}:{seq}: {line}`. Lines are ANSI-stripped
-by default so colored prompts and editor decorations don't break match
-text; pass `--raw` to match against the literal byte stream.
-
-Search is a plain substring match for now — no regex.
-
-### `rat init SHELL`
-
-Print shell integration code to stdout. `SHELL` is `zsh`, `bash`, or
-`fish`. Intended for an `eval` in your rc file.
-
-### `rat completions SHELL`
-
-Print a shell completion script to stdout. Supports `bash`, `zsh`,
-`fish`, `elvish`, and `powershell`. Tab-completes subcommands,
-option flags, and anywhere a shell value is expected.
-
-One-shot (this shell session only):
-
-```sh
-eval "$(rat completions zsh)"
-```
-
-Persistent — drop it in your shell's completion directory. Examples:
-
-```sh
-# zsh (pick a dir already on $fpath; ~/.zfunc is a common choice)
-mkdir -p ~/.zfunc
-rat completions zsh > ~/.zfunc/_rat
-# ensure fpath + autoload in ~/.zshrc if you haven't already:
-#   fpath=(~/.zfunc $fpath); autoload -U compinit && compinit
-
-# bash
-rat completions bash > ~/.local/share/bash-completion/completions/rat
-
-# fish
-rat completions fish > ~/.config/fish/completions/rat.fish
-```
-
-## Keybindings
-
-Rat uses a prefix chord for its own commands, in the tradition of `screen`
-and `tmux`. Default prefix is `Ctrl-A`. Inside an attached session:
-
-| Keys                  | Action                                                       |
-| --------------------- | ------------------------------------------------------------ |
-| `Ctrl-A` then `d`     | Detach from the session (daemon keeps running)               |
-| `Ctrl-A` then `c`     | Detach, spawn a fresh session, and attach to it              |
-| `Ctrl-A` then `s`     | Detach and open the session switcher (picker)                |
-| `Ctrl-A` then `D`     | Detach and kill the session (prompts to confirm)             |
-| `Ctrl-A` then `[`     | Enter copy mode: scroll the client-side scrollback buffer    |
-| `Ctrl-A` then `?`     | Print the chord cheatsheet in-band (session keeps running)   |
-| `Ctrl-A` `Ctrl-A`     | Send a literal `Ctrl-A` through to the inner program         |
-| `Ctrl-D`              | Normal shell EOF — exits the shell and ends the session      |
-
-All other input is forwarded verbatim to the PTY. Any unrecognized chord
-command (e.g., `Ctrl-A x`) is silently swallowed.
-
-`c` and `s` chord commands chain across sessions without leaving `rat`:
-`<prefix> s` detaches the current session, shows the picker, and attaches
-whichever you pick. `<prefix> c` detaches and immediately attaches to a
-fresh session.
-
-### Copy mode
-
-`<prefix> [` enters a read-only scrollback viewer on the alternate screen.
-While it's up, live output from the shell keeps arriving in the
-background and gets flushed to the main screen as soon as you exit.
-
-Keys inside copy mode:
-
-| Key                     | Action                                             |
-| ----------------------- | -------------------------------------------------- |
-| `j` / `↓`               | Scroll one line down (toward newer output)         |
-| `k` / `↑`               | Scroll one line up (toward older output)           |
-| `Space` / `PgDn` / `^F` | Page down                                          |
-| `b`    / `PgUp` / `^B`  | Page up                                            |
-| `g`                     | Jump to oldest line in the buffer                  |
-| `G`                     | Jump to newest line (bottom)                       |
-| `q` / `Esc`             | Exit copy mode; main screen catches up to live     |
-
-The buffer is client-side and capped at 1 MiB by default. Override
-with `RAT_SCROLLBACK_BYTES=<n>` before `rat attach`. ANSI escape
-sequences are stripped for rendering stability — copy mode trades
-colour fidelity for predictable line navigation. If you want a
-coloured-transcript search instead, use `rat grep` against the log.
-
-### Why a chord, not a single key?
-
-A lot of modern TUIs (Claude Code, editors using kitty's CSI-u or xterm's
-modifyOtherKeys) enable keyboard-encoding protocols that re-encode every
-keypress — including `Ctrl-<anything>` — into multi-byte escape sequences.
-A single-byte detach key gets silently swallowed in that regime. A two-key
-chord survives because the command key (`d`) is still distinguishable even
-if the prefix's on-the-wire encoding shifts.
-
-### Customizing the prefix
-
-Set `RAT_PREFIX` in your environment before `rat new` / `rat attach`. Two
-prefix families are supported:
+## Features
+
+### Session management
+
+- **`rat new [-n NAME] [-f] [-- CMD ...]`** — spawn a detached session and attach. Daemon `setsid`s itself so closing the terminal doesn't kill it.
+- **`rat attach ID_OR_NAME [-f]`** — by full UUID, unique UUID prefix, name, or alias.
+- **`rat list [-f]`** — arrow-key picker in a TTY (`↑↓`/`jk`, `Enter`, `q`/`Esc`/`Ctrl-C`); plain text table when piped for scripting.
+- **`rat` (no subcommand)** — spawn a fresh detached session, print the UUID, exit without attaching. Useful in scripts: `id=$(rat)`.
+- **`rat rename ID NEW_NAME`** / **`rat alias ID NEW_ALIAS`** — labels; aliases share the namespace and must be unique among live sessions.
+- **`rat kill ID [-y]`** / **`rat killall [-y]`** — graceful shutdown (SIGTERM → 2s → SIGKILL) with stale-state cleanup. `killall` flags the ambient session in the prompt so you know you're about to drop yourself.
+
+### Observation & introspection
+
+- **`rat watch ID`** — read-only tail. No input, no resize, no detach sent. Ctrl-C to stop. Pipe-friendly: `rat watch agent | tee agent.log`.
+- **`rat grep PATTERN [-s ID] [--log PATH] [--raw]`** — substring search over `PtyOutput` across any log. ANSI-stripped by default; `--raw` matches bytes. Output `{short}:{seq}: {line}` composes with unix pipes.
+- **`rat replay LOG_PATH`** — bit-exact playback of a `.log` file to stdout; pipe through a terminal to watch the session as it happened.
+- **`rat resurrect SOURCE [-n NAME] [-f]`** — spawn a fresh daemon whose log is pre-seeded with an old session's `PtyOutput`, then attach. `SOURCE` is a `.log` path or a session name/id for dead sessions still having a meta on disk. Visible scrollback is restored; shell, env, and cwd are fresh.
+
+### Keybindings
+
+Chord = press and release the prefix, then press the command key. Default prefix is `Ctrl-A`.
+
+| Keys                  | Action                                                         |
+| --------------------- | -------------------------------------------------------------- |
+| `Ctrl-A` `d`          | Detach (daemon keeps running)                                  |
+| `Ctrl-A` `c`          | Detach, spawn a fresh session, attach it                       |
+| `Ctrl-A` `s`          | Detach, open the session switcher, attach the pick             |
+| `Ctrl-A` `D`          | Detach and kill (prompts to confirm)                           |
+| `Ctrl-A` `[`          | Enter copy mode — scroll the client-side scrollback buffer     |
+| `Ctrl-A` `?`          | Print the chord cheatsheet in-band                             |
+| `Ctrl-A` `Ctrl-A`     | Send a literal `Ctrl-A` to the inner program                   |
+| `Ctrl-D`              | Normal shell EOF — exits the shell and ends the session        |
+
+Inside copy mode:
+
+| Key                     | Action                           |
+| ----------------------- | -------------------------------- |
+| `j` / `↓`               | Line down                        |
+| `k` / `↑`               | Line up                          |
+| `Space` / `PgDn` / `^F` | Page down                        |
+| `b`    / `PgUp` / `^B`  | Page up                          |
+| `g` / `G`               | Jump to oldest / newest          |
+| `q` / `Esc`             | Exit; main screen catches up     |
+
+The scrollback buffer is client-side and capped at 1 MiB (`RAT_SCROLLBACK_BYTES` to override). ANSI is stripped for rendering stability — use `rat grep` if you want coloured-transcript search.
+
+#### Customizing the prefix
+
+Set `RAT_PREFIX` before `rat new` / `rat attach`. Two families:
 
 ```sh
 export RAT_PREFIX=C-b         # Ctrl-b (tmux-style)
-export RAT_PREFIX=C-Space     # Ctrl-Space / Ctrl-@ — kinder on the pinky
-export RAT_PREFIX=M-a         # Alt-a / Meta-a — no Ctrl stretch at all
-rat new -n agent
+export RAT_PREFIX=C-Space     # Ctrl-Space / Ctrl-@ — no pinky stretch
+export RAT_PREFIX=M-a         # Alt-a / Meta-a — no Ctrl at all
 ```
 
-Supported values:
+Supported: `C-a..C-z`, `C-Space`, `C-@`, `C-\`, `C-]`, `C-^`, `C-_`, `M-<alnum>` (also `Alt-…` / `Meta-…`). Invalid values fail before raw mode so your terminal never wedges.
 
-- **Ctrl form:** `C-a` through `C-z`, `C-Space` (alias: `C-@`), plus `C-\`,
-  `C-]`, `C-^`, `C-_`.
-- **Meta form:** `M-<letter>` or `M-<digit>` (also spelled `Alt-…` or
-  `Meta-…`).
+**Meta-prefix caveat:** your terminal must send Alt-`a` as `ESC a`. iTerm2 → *Profile → Keys → General → Left/Right Option Key → Esc+*; Terminal.app → *Profile → Keyboard → Use Option as Meta*; most others do this by default. A 50 ms flush timeout delivers bare `ESC` promptly so vim/readline aren't starved.
 
-An invalid value causes `rat attach` to fail fast before entering raw mode.
+#### Why a chord, not a single key?
 
-**Meta-prefix caveat:** your terminal must send Alt-`a` as `ESC a`. iTerm2
-(*Profiles → Keys → General → Left/Right Option key → Esc+*), GNOME
-Terminal, Alacritty, and kitty do this by default or via a single setting.
-macOS's stock Terminal.app requires *Profile → Keyboard → Use Option as
-Meta key*. If Alt presses look like accented characters instead, the
-chord won't fire.
+Modern TUIs (Claude Code, helix, vim via kitty's keyboard protocol, xterm's `modifyOtherKeys`) re-encode every `Ctrl-<x>` into a multi-byte CSI sequence — a single-byte detach key gets silently eaten. A chord degrades gracefully because the command key (`d`, `c`, `s`, `[`, `?`) is still distinguishable even if the prefix's on-the-wire encoding shifts. Rat's output filter also strips the protocol-enable escape sequences from the daemon→client byte stream by default, so most TUIs can't flip the terminal into a mode that would break the chord in the first place (`RAT_PASSTHROUGH_KBD=1` disables this if you need the richer input encoding more than you need reliable detach).
 
-A Meta prefix adds a ~50ms flush timeout on bare `ESC` presses so vim and
-readline still get `ESC` delivered promptly. Ctrl-prefixes have zero
-latency.
+### Shell integration
+
+`rat init <zsh|bash|fish>` prints a snippet for your rc file. Inside a rat session your prompt gains an orange `[rat]` / `[rat:NAME]` prefix; outside rat, your prompt is untouched. Works by checking `$RAT_SESSION` / `$RAT_NAME`, which the daemon exports to the child PTY at spawn.
 
 ## Nested sessions
 
-`rat new` / `rat attach` / `rat list` detect when you're already inside a
-rat session (via `$RAT_SESSION`) and show a warning + `[y/N]` prompt before
-proceeding. Nesting isn't blocked — there are legitimate reasons to do it
-— but it's rarely what you want: detach chords route to the outermost
-client, raw-mode clients stack, and input handling gets confusing.
+`rat new` / `rat attach` / `rat list` detect when you're already inside rat (via `$RAT_SESSION`) and show a `[y/N]` confirmation before proceeding. Nesting isn't blocked — there are legitimate reasons (running rat-within-rat across an SSH jump) — but detach chords route to the outermost client, raw-mode clients stack, and input handling gets confusing. `-f` / `--force` skips the prompt.
 
-If you know what you're doing, pass `-f` / `--force` to skip the prompt,
-or detach from the outer session first.
-
-## Filesystem layout
-
-Rat keeps everything under `$XDG_STATE_HOME/rat` if set, else
-`$HOME/.local/state/rat`.
-
-```
-~/.local/state/rat/
-├── <uuid>.log            # per-session event log (append-only, JSON-lines)
-├── run/
-│   ├── <uuid>.sock       # Unix domain socket for client ↔ daemon
-│   └── <uuid>.meta.json  # pid / command / start time / sock+log paths
-├── daemon.stdout         # daemon stdout (usually empty in normal operation)
-├── daemon.stderr         # daemon stderr (errors, if any)
-└── daemon.trace          # tracing output from the daemon (tokio + rat)
-```
-
-Sock and meta files are removed on clean shutdown (or by `rat kill` on
-stale ones). Log files accumulate — they're your scrollback history, safe
-to clean up with `rm` when you don't need them.
-
-## Environment variables
+## Environment
 
 Exported by the daemon into each session:
 
 - `RAT_SESSION` — the session's UUID. Always set.
-- `RAT_NAME` — the session's name, if one was provided.
-
-Shell integrations (`rat init ...`) read these to customize the prompt.
-You can read them directly in scripts too — e.g., `if [ -n "$RAT_SESSION" ]`
-to know whether you're inside rat.
+- `RAT_NAME` — the session's name, if one was given.
 
 Read by the `rat` client:
 
-- `RAT_PREFIX` — override the default `Ctrl-A` detach prefix. See
-  [Keybindings](#keybindings).
-- `RAT_PASSTHROUGH_KBD` — set to `1` to disable the keyboard-protocol
-  stripper. By default the client swallows `CSI > … u` / `CSI = … u` /
-  `CSI < u` / `CSI ? … u` (kitty keyboard protocol) and `CSI > 4 … m`
-  (xterm modifyOtherKeys) from the daemon→client byte stream so that
-  inner TUIs can't flip your terminal into a mode that re-encodes the
-  detach chord. With passthrough on, you get richer keyboard input
-  inside apps like Claude Code, but the detach chord may stop working
-  while such an app is in the foreground — you'll have to exit the app
-  to detach.
+- `RAT_PREFIX` — override the default `Ctrl-A` chord prefix. See [Keybindings](#keybindings).
+- `RAT_SCROLLBACK_BYTES` — copy-mode ring-buffer size (default 1 MiB).
+- `RAT_PASSTHROUGH_KBD` — set to `1` to disable the keyboard-protocol stripper. Inner TUIs get richer input; chord detach may stop working until you exit the TUI.
+
+## Filesystem layout
+
+```
+$XDG_STATE_HOME/rat   (default: ~/.local/state/rat)
+├── <uuid>.log            # per-session event log (JSON-lines, append-only)
+├── run/
+│   ├── <uuid>.sock       # Unix domain socket for client ↔ daemon
+│   └── <uuid>.meta.json  # pid · command · start time · paths · name · aliases
+├── daemon.stdout
+├── daemon.stderr
+└── daemon.trace          # fine-grained daemon tracing (always on)
+```
+
+Sock + meta are removed on clean shutdown (or by `rat kill` / `rat killall` on stale state). `.log` files accumulate — they're your scrollback history and are safe to `rm` when you don't need them.
 
 ## Architecture (tl;dr)
 
-Rat is split into a small library and two binaries:
+Two binaries and one library:
 
-- `rat` — the launcher / interactive client
-- `rat-daemon` — the headless session host
-- shared `rat` library — event types, file-backed event log, wire protocol,
-  paths, session metadata
+- **`rat`** — the interactive CLI, client, and launcher.
+- **`rat-daemon`** — the headless session host. Holds the PTY, appends events to the log, listens on a Unix socket, broadcasts live events to attached clients.
+- **library** — `event.rs`, `log.rs`, `session.rs`, `paths.rs`, `protocol.rs`.
 
-The daemon holds a PTY running your shell. It reads PTY output, appends
-each chunk to the session's event log, and broadcasts the logged event to
-all attached clients. Client input flows the other way: read from stdin,
-log as `ClientInput`, write to the PTY.
+The daemon reads PTY output, appends each chunk to the session's event log, and broadcasts the logged event to attached clients. Client input flows the other way: read stdin, log as `ClientInput`, write to the PTY.
 
-The event log is the source of truth. Reattach replays the log (up to a
-snapped sequence number) and then subscribes to the live broadcast for
-events appended afterward.
+The event log is the source of truth. Attach replays the log up to a snapped sequence number and then subscribes to the live broadcast for events appended afterwards — no duplicates, no gaps.
 
 Full details: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Troubleshooting
 
 **"daemon didn't bind socket within 3s"**
-The `rat-daemon` binary failed to start or panicked before binding its
-socket. Check `~/.local/state/rat/daemon.stderr` and `daemon.trace` for
-the actual error.
+`rat-daemon` failed to start or panicked before binding its socket. Check `~/.local/state/rat/daemon.stderr` and `daemon.trace`.
 
 **The shell I spawn exits immediately.**
-Make sure your `~/.zshrc` / `~/.bashrc` doesn't have an `exit` or a hard
-error in it. Rat propagates your whole environment to the child, so if
-something in your rc files fails, the shell fails too. Run with
-`RUST_LOG=debug rat new` for more tracing.
+Your rc file has an `exit` or a hard error in it. Rat propagates your whole environment to the child, so rc failures fail the shell. `RUST_LOG=debug rat new` for more tracing.
 
-**I see a stale session in `rat list` marked "dead".**
-The daemon crashed or was killed without cleanup. `rat kill <id>` sweeps
-dead-session state files even without hitting any live process.
+**A stale session shows up in `rat list` marked "dead".**
+Daemon crashed without cleanup. `rat kill <id>` sweeps dead-session state even without any live process to signal. `rat killall` sweeps every dead one in a single pass.
 
-**My prompt doesn't show `[rat]` inside a session.**
-Make sure you added the `eval "$(rat init ...)"` line to the rc file that
-actually runs in interactive subshells. For zsh that's `~/.zshrc`; for
-bash on macOS it's often `~/.bash_profile`. Verify with
-`echo $RAT_SESSION` inside the session — if it's set but your prompt is
-unchanged, the integration isn't being sourced.
+**Prompt doesn't show `[rat]` inside a session.**
+Make sure `eval "$(rat init ...)"` is in the rc file that runs in interactive shells. For zsh that's `~/.zshrc`; for bash on macOS it's often `~/.bash_profile`. Verify with `echo $RAT_SESSION` — if it's set but the prompt isn't decorated, the integration isn't sourced.
+
+**TUI inside my session has weird keyboard behaviour.**
+Rat strips kitty-keyboard-protocol and xterm-`modifyOtherKeys` enable sequences so the detach chord keeps working. If an inner app depends on those protocols and misbehaves, `RAT_PASSTHROUGH_KBD=1 rat attach …` disables the filter.
 
 **Terminal looks wedged after a crash.**
-Run `reset` or `stty sane`. Rat tries to restore cooked mode on Drop, but
-a hard kill (`kill -9` on the client) bypasses that.
+`reset` or `stty sane`. Rat restores cooked mode on Drop, but a hard kill (`kill -9 rat`) bypasses that.
 
-**A TUI inside my session has weirder-than-usual keyboard behaviour.**
-Rat strips kitty-keyboard-protocol and xterm-modifyOtherKeys enable
-sequences from PTY output so the detach chord keeps working. If an inner
-app depends on those protocols and misbehaves as a result, set
-`RAT_PASSTHROUGH_KBD=1` before attaching. Trade-off: the app gets the
-richer input, but detaching may only work once you've exited the app.
+**`rat watch` output doesn't redraw cleanly.**
+Watch doesn't enter raw mode or send resizes — if your watching terminal is a different size from the attached one, VT sequences designed for the attacher may render odd. Resize your watching terminal to match.
 
 ## Roadmap
 
 In rough priority order:
 
-1. **Binary wire protocol.** JSON-lines is great for debugging; for
-   production the log and wire format should be compact and fast (postcard
-   / bincode).
-2. **Remote attach.** `rat attach user@host:session` — today the socket is
-   host-local. SSH multiplexing or a small TCP-tunneling protocol would
-   unlock the cloud-terminal pitch.
-3. **Log compaction.** Session logs grow without bound. For long-running
-   sessions, snapshot the terminal state periodically so replay doesn't
-   scale linearly with session age.
-4. **Full terminal emulation for replay.** Today `rat replay` dumps raw
-   PTY bytes. A proper VT100/VT220 emulator + "jump to time" would make
-   scrollback searchable and give a real session-browser experience.
-5. **Multiple panes / windows.** Core terminal-multiplexer UX is still
-   missing; rat focuses on persistence first.
-6. **Windows support.** `portable-pty` works on Windows but our
-   Unix-socket transport and `setsid` detach don't. Named pipes + a
-   different detach strategy would bridge this.
-7. **Durable state beyond one host.** The log is already the source of
-   truth; putting it on a shared filesystem (or object store, or sqlite
-   replica) would let sessions migrate between hosts.
+1. **Windows support.** `portable-pty` works there already; we need named pipes instead of Unix sockets and a non-`setsid` detach strategy. Once shipped, the one-liner installer picks up a Windows target and rat is genuinely cross-platform.
+2. **Remote attach** — `rat attach user@host:session`. The socket is host-local today; SSH multiplexing or a small tunnelling protocol unlocks the cloud-terminal pitch.
+3. **Binary wire protocol.** JSON-lines is excellent for debugging; postcard/bincode is right for production once the shape stabilizes.
+4. **Log compaction + VT-backed snapshots.** Session logs grow unbounded. Periodic snapshots via a VT100/220 emulator (e.g. `vte`) would bound replay cost and unlock a "jump to time" scroll UX.
+5. **Panes / windows.** Core multiplexer UX; deliberately deferred while rat focuses on persistence.
+6. **Durable state beyond one host.** The log is already the source of truth; putting it on shared filesystem / object store / sqlite replica lets sessions migrate.
 
 ## Contributing
 
-Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for dev
-setup, code style, and the PR flow.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, code style, PR flow, and the Conventional-Commits grammar the release automation expects. In short: `feat:` bumps minor, `fix:` bumps patch, `feat!:` / `BREAKING CHANGE:` bumps major; don't hand-edit `Cargo.toml`, `Cargo.lock`, or `CHANGELOG.md` — release-please owns all three.
 
 ## License
 
-[MIT](LICENSE). See LICENSE file for full text.
+[MIT](LICENSE).
